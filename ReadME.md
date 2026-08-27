@@ -2,6 +2,13 @@
 
 This repository contains implementation of the paper: [Less is More: Improving LLM Alignment via Preference Data Selection][paper-link].
 
+## OLMo 2 1B + UltraFeedback workflow
+
+For the reproducible, workspace-local two-GPU workflow added for this machine, start with
+[`notebooks/01_create_bees_ultrafeedback_olmo2.ipynb`](notebooks/01_create_bees_ultrafeedback_olmo2.ipynb),
+then run [`notebooks/02_train_olmo2_1b_dpo.ipynb`](notebooks/02_train_olmo2_1b_dpo.ipynb).
+See [`OLMO2_BEES_README.md`](OLMO2_BEES_README.md) for the design, storage layout, and accuracy gate.
+
 ## Features
 
 - Standard SFT, DPO, IPO, KTO training implementation

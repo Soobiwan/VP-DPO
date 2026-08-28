@@ -32,6 +32,81 @@ TIDPO_REPOSITORY = "https://github.com/gracefulning/TIDPO"
 TIDPO_COMMIT = "e04a0926869a8f9fe9c9e9ce395394fd2c697fe2"
 
 
+def _optimizer_update_32bit(
+    functional,
+    optimizer_name,
+    local_grad,
+    local_parameter,
+    state,
+    config,
+    step,
+    gnorm_scale,
+) -> None:
+    """Call the bitsandbytes kernel without shifting its positional tensor arguments."""
+    functional.optimizer_update_32bit(
+        optimizer_name,
+        local_grad,
+        local_parameter,
+        state["state1"],
+        config["betas"][0],
+        config["eps"],
+        step,
+        config["lr"],
+        state["state2"],
+        config["betas"][1],
+        config["betas"][2] if len(config["betas"]) >= 3 else 0.0,
+        config.get("alpha", 0.0),
+        config["weight_decay"],
+        gnorm_scale,
+        state["unorm_vec"] if config["max_unorm"] > 0.0 else None,
+        max_unorm=config["max_unorm"],
+        skip_zeros=config["skip_zeros"],
+    )
+
+
+def _optimizer_contract_self_test() -> dict[str, Any]:
+    class Recorder:
+        def __init__(self):
+            self.args = None
+            self.kwargs = None
+
+        def optimizer_update_32bit(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+    recorder = Recorder()
+    state1, state2, unorm = object(), object(), object()
+    config = {
+        "betas": (0.9, 0.95),
+        "eps": 1e-8,
+        "lr": 5e-7,
+        "alpha": 0.0,
+        "weight_decay": 0.0,
+        "max_unorm": 1.0,
+        "skip_zeros": False,
+    }
+    _optimizer_update_32bit(
+        recorder,
+        "adam",
+        "gradient",
+        "parameter",
+        {"state1": state1, "state2": state2, "unorm_vec": unorm},
+        config,
+        3,
+        1.0,
+    )
+    assert recorder.args is not None and recorder.kwargs is not None
+    assert recorder.args[7] == config["lr"]
+    assert recorder.args[8] is state2
+    assert recorder.args[14] is unorm
+    assert recorder.kwargs == {"max_unorm": 1.0, "skip_zeros": False}
+    return {
+        "learning_rate_argument_index": 7,
+        "state2_argument_index": 8,
+        "unorm_argument_index": 14,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Two-GPU full-parameter OLMo training for TIDPO, SimPO, and SamPO"
@@ -979,23 +1054,15 @@ def run_train(args: argparse.Namespace) -> None:
                 )
             else:
                 gnorm_scale = 1.0
-            bnb_functional.optimizer_update_32bit(
+            _optimizer_update_32bit(
+                bnb_functional,
                 self.optimizer_name,
                 local_grad,
                 local_parameter,
-                state["state1"],
-                config["betas"][0],
-                config["eps"],
+                state,
+                config,
                 step,
-                state["state2"],
-                config["betas"][1],
-                config["betas"][2] if len(config["betas"]) >= 3 else 0.0,
-                config.get("alpha", 0.0),
-                config["weight_decay"],
                 gnorm_scale,
-                state["unorm_vec"] if config["max_unorm"] > 0.0 else None,
-                max_unorm=config["max_unorm"],
-                skip_zeros=config["skip_zeros"],
             )
 
         @torch.no_grad()
@@ -1580,7 +1647,9 @@ def main() -> None:
         run_train(args)
     elif args.command == "self-test":
         configure_workspace(args.workspace)
-        print(json.dumps(run_loss_self_tests(), indent=2))
+        results = run_loss_self_tests()
+        results["optimizer_update_32bit_contract"] = _optimizer_contract_self_test()
+        print(json.dumps(results, indent=2))
     else:
         raise AssertionError(args.command)
 

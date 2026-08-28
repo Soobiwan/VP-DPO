@@ -67,7 +67,12 @@ def build_parser() -> argparse.ArgumentParser:
     train = subparsers.add_parser("train", help="Train one preference method")
     train.add_argument("--workspace", type=Path, required=True)
     train.add_argument("--dataset-path", type=Path, required=True)
-    train.add_argument("--reference-cache", type=Path, required=True)
+    train.add_argument(
+        "--reference-cache",
+        type=Path,
+        default=None,
+        help="Required for TIDPO and SamPO; SimPO is reference-free",
+    )
     train.add_argument("--train-split", default="train")
     train.add_argument("--model-id", required=True)
     train.add_argument("--model-revision", default=None)
@@ -316,8 +321,8 @@ def run_reference(args: argparse.Namespace) -> None:
     if accelerator.num_processes != 2:
         raise RuntimeError("Reference preparation requires exactly two Accelerate processes")
     dataset = _load_split(args.dataset_path, args.split)
-    if args.tidpo_kl_top_k < 1:
-        raise ValueError("--tidpo-kl-top-k must be positive")
+    if args.tidpo_kl_top_k < 0:
+        raise ValueError("--tidpo-kl-top-k cannot be negative")
     required = {
         "dataset_index",
         "row_id",
@@ -425,13 +430,18 @@ def run_reference(args: argparse.Namespace) -> None:
                 "row_id": int(row["row_id"]),
                 "ref_chosen_token_logps": pair_logps[0, :chosen_width].cpu().tolist(),
                 "ref_rejected_token_logps": pair_logps[1, :rejected_width].cpu().tolist(),
+            }
+            if args.tidpo_kl_top_k:
                 # Store only response positions. The segmented completion mask restores alignment
                 # in the collator and avoids serializing K zeros at every prompt position.
-                "ref_chosen_support_ids": support_ids[0][completion_mask[0]].cpu().tolist(),
-                "ref_rejected_support_ids": support_ids[1][completion_mask[1]].cpu().tolist(),
-                "ref_chosen_support_logps": support_logps[0][completion_mask[0]].cpu().tolist(),
-                "ref_rejected_support_logps": support_logps[1][completion_mask[1]].cpu().tolist(),
-            }
+                record.update(
+                    {
+                        "ref_chosen_support_ids": support_ids[0][completion_mask[0]].cpu().tolist(),
+                        "ref_rejected_support_ids": support_ids[1][completion_mask[1]].cpu().tolist(),
+                        "ref_chosen_support_logps": support_logps[0][completion_mask[0]].cpu().tolist(),
+                        "ref_rejected_support_logps": support_logps[1][completion_mask[1]].cpu().tolist(),
+                    }
+                )
             if args.with_tidpo_anchors:
                 anchor_ids, anchor_mask, anchor_logps = _generate_reference_anchor(
                     model, tokenizer, row, args, dataset_index, accelerator.device
@@ -444,10 +454,14 @@ def run_reference(args: argparse.Namespace) -> None:
                     }
                 )
             arrays = [record["ref_chosen_token_logps"], record["ref_rejected_token_logps"]]
-            nested_arrays = [
-                record["ref_chosen_support_logps"],
-                record["ref_rejected_support_logps"],
-            ]
+            nested_arrays = (
+                [
+                    record["ref_chosen_support_logps"],
+                    record["ref_rejected_support_logps"],
+                ]
+                if args.tidpo_kl_top_k
+                else []
+            )
             if args.with_tidpo_anchors:
                 arrays.append(record["ref_anchor_token_logps"])
             if not all(math.isfinite(value) for array in arrays for value in array):
@@ -469,53 +483,94 @@ def run_reference(args: argparse.Namespace) -> None:
         os.fsync(handle.fileno())
 
     accelerator.wait_for_everyone()
+    # Release both reference-model replicas before rank 0 converts the potentially multi-GB
+    # JSONL cache.  The conversion below interleaves rank files one row at a time instead of
+    # materializing millions of nested Python numbers in host RAM (important on Kaggle's 29 GB
+    # GPU workers).
+    del model
+    torch.cuda.empty_cache()
+    accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        records: dict[int, dict[str, Any]] = {}
-        for process_rank in range(world_size):
-            part = _read_jsonl_records(args.output_dir / f"part-rank-{process_rank:02d}.jsonl")
-            overlap = set(records).intersection(part)
-            if overlap:
-                raise RuntimeError(f"Duplicate indices across reference ranks: {sorted(overlap)[:10]}")
-            records.update(part)
-        expected = set(range(len(dataset)))
-        if set(records) != expected:
-            raise RuntimeError(
-                f"Reference coverage mismatch; missing={sorted(expected - set(records))[:10]}, "
-                f"extra={sorted(set(records) - expected)[:10]}"
-            )
-        ordered = [records[index] for index in range(len(dataset))]
-        for index, record in enumerate(ordered):
-            row = dataset[index]
-            if record["row_id"] != int(row["row_id"]):
-                raise RuntimeError(f"Reference row mismatch at index {index}")
-            if len(record["ref_chosen_token_logps"]) != len(row["chosen_input_ids"]) - 1:
-                raise RuntimeError(f"Chosen reference width mismatch at index {index}")
-            if len(record["ref_rejected_token_logps"]) != len(row["rejected_input_ids"]) - 1:
-                raise RuntimeError(f"Rejected reference width mismatch at index {index}")
-            for side in ("chosen", "rejected"):
-                expected_width = sum(value >= 0 for value in row[f"{side}_segment_ids"][1:])
-                support_ids = record[f"ref_{side}_support_ids"]
-                support_logps = record[f"ref_{side}_support_logps"]
-                if len(support_ids) != expected_width or len(support_logps) != expected_width:
-                    raise RuntimeError(
-                        f"{side.title()} response top-k support width mismatch at index {index}"
-                    )
-                if any(len(values) != args.tidpo_kl_top_k for values in support_ids):
-                    raise RuntimeError(f"{side.title()} top-k ID count mismatch at index {index}")
-                if any(len(values) != args.tidpo_kl_top_k for values in support_logps):
-                    raise RuntimeError(f"{side.title()} top-k logp count mismatch at index {index}")
-        cache = Dataset.from_list(ordered)
-        with tempfile.TemporaryDirectory(prefix=".token-reference-", dir=args.output_dir) as temp:
-            staged = Path(temp) / "dataset"
-            cache.save_to_disk(staged)
-            staged.replace(cache_path)
+        part_paths = [
+            args.output_dir / f"part-rank-{process_rank:02d}.jsonl"
+            for process_rank in range(world_size)
+        ]
+        handles = [path.open("r", encoding="utf-8") for path in part_paths]
+        try:
+            with tempfile.TemporaryDirectory(prefix=".token-reference-", dir=args.output_dir) as temp:
+                temporary_root = Path(temp)
+                merged_jsonl = temporary_root / "ordered.jsonl"
+                with merged_jsonl.open("w", encoding="utf-8") as merged:
+                    for index in range(len(dataset)):
+                        handle = handles[index % world_size]
+                        line = handle.readline()
+                        while line and not line.strip():
+                            line = handle.readline()
+                        if not line:
+                            raise RuntimeError(f"Reference cache ends before dataset index {index}")
+                        try:
+                            record = json.loads(line)
+                        except json.JSONDecodeError as error:
+                            raise RuntimeError(
+                                f"Invalid reference JSON for dataset index {index}"
+                            ) from error
+                        if int(record.get("dataset_index", -1)) != index:
+                            raise RuntimeError(
+                                f"Reference order mismatch: expected {index}, "
+                                f"got {record.get('dataset_index')}"
+                            )
+                        row = dataset[index]
+                        if record["row_id"] != int(row["row_id"]):
+                            raise RuntimeError(f"Reference row mismatch at index {index}")
+                        if len(record["ref_chosen_token_logps"]) != len(row["chosen_input_ids"]) - 1:
+                            raise RuntimeError(f"Chosen reference width mismatch at index {index}")
+                        if len(record["ref_rejected_token_logps"]) != len(row["rejected_input_ids"]) - 1:
+                            raise RuntimeError(f"Rejected reference width mismatch at index {index}")
+                        for side in ("chosen", "rejected") if args.tidpo_kl_top_k else ():
+                            expected_width = sum(
+                                value >= 0 for value in row[f"{side}_segment_ids"][1:]
+                            )
+                            support_ids = record[f"ref_{side}_support_ids"]
+                            support_logps = record[f"ref_{side}_support_logps"]
+                            if (
+                                len(support_ids) != expected_width
+                                or len(support_logps) != expected_width
+                            ):
+                                raise RuntimeError(
+                                    f"{side.title()} response top-k support width mismatch "
+                                    f"at index {index}"
+                                )
+                            if any(len(values) != args.tidpo_kl_top_k for values in support_ids):
+                                raise RuntimeError(
+                                    f"{side.title()} top-k ID count mismatch at index {index}"
+                                )
+                            if any(len(values) != args.tidpo_kl_top_k for values in support_logps):
+                                raise RuntimeError(
+                                    f"{side.title()} top-k logp count mismatch at index {index}"
+                                )
+                        merged.write(line.rstrip("\r\n") + "\n")
+                    for process_rank, handle in enumerate(handles):
+                        if any(line.strip() for line in handle):
+                            raise RuntimeError(
+                                f"Reference rank {process_rank} contains unexpected extra rows"
+                            )
+                cache = Dataset.from_json(str(merged_jsonl), keep_in_memory=False)
+                if cache["dataset_index"] != list(range(len(dataset))):
+                    raise RuntimeError("Merged reference cache order is invalid")
+                staged = temporary_root / "dataset"
+                cache.save_to_disk(staged)
+                cache_columns = cache.column_names
+                staged.replace(cache_path)
+        finally:
+            for handle in handles:
+                handle.close()
         write_json(
             manifest_path,
             {
                 **identity,
                 "world_size": world_size,
                 "compute_dtype": "float16",
-                "columns": cache.column_names,
+                "columns": cache_columns,
                 "packages": package_versions(
                     ["torch", "transformers", "datasets", "accelerate", "safetensors"]
                 ),
@@ -523,14 +578,21 @@ def run_reference(args: argparse.Namespace) -> None:
         )
         print(f"Saved shared token reference cache: {cache_path}")
     accelerator.wait_for_everyone()
-    del model
-    torch.cuda.empty_cache()
     accelerator.end_training()
 
 
 class PreferenceTokenCollator:
-    def __init__(self, pad_token_id: int, include_anchors: bool):
+    def __init__(
+        self,
+        pad_token_id: int,
+        *,
+        include_reference: bool,
+        include_support: bool,
+        include_anchors: bool,
+    ):
         self.pad_token_id = int(pad_token_id)
+        self.include_reference = include_reference
+        self.include_support = include_support
         self.include_anchors = include_anchors
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
@@ -548,7 +610,9 @@ class PreferenceTokenCollator:
         attention_mask = torch.zeros((len(rows), width), dtype=torch.long)
         completion_mask = torch.zeros((len(rows), width - 1), dtype=torch.bool)
         reference_logps = torch.zeros((len(rows), width - 1), dtype=torch.float32)
-        support_width = len(features[0]["ref_chosen_support_ids"][0])
+        support_width = (
+            len(features[0]["ref_chosen_support_ids"][0]) if self.include_support else 0
+        )
         reference_support_ids = torch.zeros(
             (len(rows), width - 1, support_width), dtype=torch.long
         )
@@ -558,11 +622,8 @@ class PreferenceTokenCollator:
         for index, (feature, side) in enumerate(rows):
             ids = feature[f"{side}_input_ids"]
             segment_ids = feature[f"{side}_segment_ids"]
-            ref = feature[f"ref_{side}_token_logps"]
-            support_ids = feature[f"ref_{side}_support_ids"]
-            support_logps = feature[f"ref_{side}_support_logps"]
             length = len(ids)
-            if len(segment_ids) != length or len(ref) != length - 1:
+            if len(segment_ids) != length:
                 raise RuntimeError(f"Malformed {side} token cache for row {feature['row_id']}")
             completion_mask[index, : length - 1] = torch.as_tensor(
                 segment_ids[1:], dtype=torch.long
@@ -570,23 +631,36 @@ class PreferenceTokenCollator:
             completion_positions = torch.nonzero(
                 completion_mask[index, : length - 1], as_tuple=False
             ).squeeze(-1)
-            support_shape_ok = (
-                len(support_ids) == int(completion_positions.numel())
-                and len(support_logps) == int(completion_positions.numel())
-                and all(len(values) == support_width for values in support_ids)
-                and all(len(values) == support_width for values in support_logps)
-            )
-            if not support_shape_ok:
-                raise RuntimeError(f"Malformed {side} token cache for row {feature['row_id']}")
             input_ids[index, :length] = torch.as_tensor(ids, dtype=torch.long)
             attention_mask[index, :length] = 1
-            reference_logps[index, : length - 1] = torch.as_tensor(ref, dtype=torch.float32)
-            reference_support_ids[index, completion_positions] = torch.as_tensor(
-                support_ids, dtype=torch.long
-            )
-            reference_support_logps[index, completion_positions] = torch.as_tensor(
-                support_logps, dtype=torch.float32
-            )
+            if self.include_reference:
+                ref = feature[f"ref_{side}_token_logps"]
+                if len(ref) != length - 1:
+                    raise RuntimeError(
+                        f"Malformed {side} reference cache for row {feature['row_id']}"
+                    )
+                reference_logps[index, : length - 1] = torch.as_tensor(
+                    ref, dtype=torch.float32
+                )
+            if self.include_support:
+                support_ids = feature[f"ref_{side}_support_ids"]
+                support_logps = feature[f"ref_{side}_support_logps"]
+                support_shape_ok = (
+                    len(support_ids) == int(completion_positions.numel())
+                    and len(support_logps) == int(completion_positions.numel())
+                    and all(len(values) == support_width for values in support_ids)
+                    and all(len(values) == support_width for values in support_logps)
+                )
+                if not support_shape_ok:
+                    raise RuntimeError(
+                        f"Malformed {side} TIDPO support for row {feature['row_id']}"
+                    )
+                reference_support_ids[index, completion_positions] = torch.as_tensor(
+                    support_ids, dtype=torch.long
+                )
+                reference_support_logps[index, completion_positions] = torch.as_tensor(
+                    support_logps, dtype=torch.float32
+                )
         output = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -681,38 +755,50 @@ def run_train(args: argparse.Namespace) -> None:
     set_seed(args.seed)
 
     train_dataset = _load_split(args.dataset_path, args.train_split)
-    cache_path = args.reference_cache.resolve() / "dataset"
-    manifest_path = args.reference_cache.resolve() / "reference_manifest.json"
-    if not cache_path.is_dir() or not manifest_path.is_file():
-        raise FileNotFoundError(f"Run the token reference stage first: {cache_path}")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    expected = {
-        "cache_schema_version": 2,
-        "dataset_path": str(args.dataset_path.resolve()),
-        "dataset_fingerprint": train_dataset._fingerprint,
-        "split": args.train_split,
-        "rows": len(train_dataset),
-        "model_id": args.model_id,
-        "model_revision": args.model_revision,
-        "tidpo_kl_top_k": args.tidpo_kl_top_k,
-    }
-    mismatches = {
-        key: (manifest.get(key), value)
-        for key, value in expected.items()
-        if manifest.get(key) != value
-    }
-    if mismatches:
-        raise RuntimeError(f"Reference cache does not match this training run: {mismatches}")
-    reference = load_from_disk(str(cache_path))
-    if len(reference) != len(train_dataset):
-        raise RuntimeError("Reference cache length differs from training data")
-    if reference["dataset_index"] != train_dataset["dataset_index"]:
-        raise RuntimeError("Reference cache order differs from training data")
-    if reference["row_id"] != train_dataset["row_id"]:
-        raise RuntimeError("Reference cache row IDs differ from training data")
-    cache_columns = [column for column in reference.column_names if column not in {"dataset_index", "row_id"}]
-    for column in cache_columns:
-        train_dataset = train_dataset.add_column(column, reference[column])
+    needs_reference = args.method in {"TIDPO", "SamPO"}
+    expected = {"dataset_fingerprint": train_dataset._fingerprint}
+    if needs_reference:
+        if args.reference_cache is None:
+            raise ValueError(f"--reference-cache is required for {args.method}")
+        cache_path = args.reference_cache.resolve() / "dataset"
+        manifest_path = args.reference_cache.resolve() / "reference_manifest.json"
+        if not cache_path.is_dir() or not manifest_path.is_file():
+            raise FileNotFoundError(f"Run the token reference stage first: {cache_path}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        # The content fingerprint is authoritative. Do not compare the absolute dataset path:
+        # Kaggle mounts a reference-only notebook's validated cache under /kaggle/input in the
+        # subsequent training session.
+        expected.update(
+            {
+                "cache_schema_version": 2,
+                "split": args.train_split,
+                "rows": len(train_dataset),
+                "model_id": args.model_id,
+                "model_revision": args.model_revision,
+                "tidpo_kl_top_k": args.tidpo_kl_top_k,
+            }
+        )
+        mismatches = {
+            key: (manifest.get(key), value)
+            for key, value in expected.items()
+            if manifest.get(key) != value
+        }
+        if mismatches:
+            raise RuntimeError(f"Reference cache does not match this training run: {mismatches}")
+        reference = load_from_disk(str(cache_path))
+        if len(reference) != len(train_dataset):
+            raise RuntimeError("Reference cache length differs from training data")
+        if reference["dataset_index"] != train_dataset["dataset_index"]:
+            raise RuntimeError("Reference cache order differs from training data")
+        if reference["row_id"] != train_dataset["row_id"]:
+            raise RuntimeError("Reference cache row IDs differ from training data")
+        cache_columns = [
+            column
+            for column in reference.column_names
+            if column not in {"dataset_index", "row_id"}
+        ]
+        for column in cache_columns:
+            train_dataset = train_dataset.add_column(column, reference[column])
 
     support_columns = {
         "ref_chosen_support_ids",
@@ -720,7 +806,8 @@ def run_train(args: argparse.Namespace) -> None:
         "ref_chosen_support_logps",
         "ref_rejected_support_logps",
     }
-    if not support_columns.issubset(train_dataset.column_names):
+    include_support = args.method == "TIDPO"
+    if include_support and not support_columns.issubset(train_dataset.column_names):
         raise RuntimeError(
             "Reference cache has no TIDPO top-k KL support; rerun the reference command"
         )
@@ -1339,7 +1426,12 @@ def run_train(args: argparse.Namespace) -> None:
         model=model,
         args=training_args,
         train_dataset=train_dataset,
-        data_collator=PreferenceTokenCollator(tokenizer.pad_token_id, include_anchors),
+        data_collator=PreferenceTokenCollator(
+            tokenizer.pad_token_id,
+            include_reference=needs_reference,
+            include_support=include_support,
+            include_anchors=include_anchors,
+        ),
         processing_class=tokenizer,
     )
     trainer.create_optimizer()
@@ -1428,7 +1520,9 @@ def run_train(args: argparse.Namespace) -> None:
                 "model_revision": args.model_revision,
                 "dataset_path": str(args.dataset_path.resolve()),
                 "dataset_fingerprint": expected["dataset_fingerprint"],
-                "reference_cache": str(args.reference_cache.resolve()),
+                "reference_cache": (
+                    str(args.reference_cache.resolve()) if args.reference_cache is not None else None
+                ),
                 "final_model": str(final_dir),
                 "tidpo_upstream_repository": TIDPO_REPOSITORY,
                 "tidpo_upstream_commit": TIDPO_COMMIT,
@@ -1437,7 +1531,7 @@ def run_train(args: argparse.Namespace) -> None:
                     "kind": "reference_topk_plus_remainder_bucket_lower_bound",
                     "top_k": args.tidpo_kl_top_k,
                     "exact_full_vocabulary": False,
-                    "reason": "fit full-parameter OLMo plus optimizer state across 12GB+8GB GPUs",
+                    "reason": "avoid a resident full reference model during full-parameter training",
                 },
                 "tidpo_importance_normalization": (
                     "all_nonpadding_sequence_tokens_then_apply_at_response_positions"

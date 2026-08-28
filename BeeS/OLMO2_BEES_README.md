@@ -26,9 +26,15 @@ The workspace root also contains two experiment notebooks built on the same prep
 split and memory-validated OLMo/FSDP2 path:
 
 - `olmo_bees_all_methods_dual_gpu.ipynb` trains the five segment-structured variants.
-- `olmo_bees_tidpo_simpo_sampo_train_eval.ipynb` trains TIDPO, SimPO, and SamPO sequentially from
-  the same pinned base model, then runs the shared held-out and `lm-eval` comparison. The imported
-  TIDPO source and integration notes live under `third_party/TIDPO`.
+- `olmo_bees_tidpo_kaggle_t4x2.ipynb`, `olmo_bees_simpo_kaggle_t4x2.ipynb`, and
+  `olmo_bees_sampo_kaggle_t4x2.ipynb` are independent Kaggle T4 x2 workflows. Each persists only
+  one final FP32 model; prepared data, model/package caches, reference statistics, rank shards, and
+  transient optimizer state stay in `/kaggle/temp` and are deleted after use. Training and
+  evaluation are separate selectable sessions so neither silently overruns Kaggle's runtime or
+  20 GB output limits. TIDPO's top-k/anchor cache has its own first session and is attached
+  read-only for training, keeping both long stages within separate 12-hour windows. The imported
+  TIDPO source and integration notes live under
+  `third_party/TIDPO`.
 
 All downloads, temporary files, package caches, datasets, checkpoints, and evaluation results are
 redirected into the parent workspace (`VPDPO/.cache`, `VPDPO/.tmp`, and `VPDPO/artifacts`).

@@ -1,0 +1,14 @@
+Llama:
+  completions_kwargs:
+    do_sample: true
+    max_new_tokens: 4096
+    model_kwargs:
+      torch_dtype: bfloat16
+    model_name: your_model_path
+    save_name: your_save_name
+    stop_token_ids:
+    - 128001
+    - 128009
+    temperature: 0.7
+    top_p: 1.0
+  prompt_template: adpo/eval/templates/llama3.txt

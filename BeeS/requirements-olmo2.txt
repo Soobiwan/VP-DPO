@@ -1,0 +1,24 @@
+# Install a CUDA-enabled PyTorch build separately if `import torch` does not already work.
+# The versions below were current and mutually compatible on 2026-08-13.
+transformers==5.14.1
+datasets==5.0.0
+accelerate==1.14.0
+trl==1.9.0
+bitsandbytes==0.49.2
+huggingface-hub==1.27.0
+safetensors==0.8.0
+tqdm==4.67.1
+numpy==2.4.6
+pyarrow==23.0.0
+matplotlib==3.10.9
+ipywidgets==8.1.8
+ipykernel==7.2.0
+nbformat==5.10.4
+lm_eval[hf,ifeval]==0.4.12
+chardet==5.2.0
+alpaca-eval==0.6.6
+openai>=1.5,<3
+python-dotenv==1.1.0
+PyYAML==6.0.3
+nbclient==0.10.4
+setuptools==80.10.2

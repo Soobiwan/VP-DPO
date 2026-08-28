@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/gracefulning/TIDPO",
+  "commit": "e04a0926869a8f9fe9c9e9ce395394fd2c697fe2",
+  "imported_on": "2026-08-23",
+  "import_method": "GitHub codeload commit archive",
+  "local_integration": "BeeS/olmo2_bees/train_preference_suite.py",
+  "notes": "The upstream snapshot is retained as source/provenance. OLMo uses the workspace's modern FSDP2 adapter because the upstream dependency pins and resident-reference architecture do not fit this machine's validated dual-8GB full-parameter path."
+}

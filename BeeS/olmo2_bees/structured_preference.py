@@ -11,7 +11,8 @@ from typing import Any, Iterable
 
 
 REQUESTED_VARIANTS = ("A", "B-DPO", "B-VDPO", "C-DPO", "C-VDPO")
-SUPPORTED_VARIANTS = ("DPO", *REQUESTED_VARIANTS)
+NORMALIZED_METHOD_B_VARIANTS = ("B_norm-DPO", "B_norm-VDPO")
+SUPPORTED_VARIANTS = ("DPO", *REQUESTED_VARIANTS, *NORMALIZED_METHOD_B_VARIANTS)
 
 VARIANT_DESCRIPTIONS = {
     "DPO": "Optional response-level DPO control (not part of the five requested structured runs).",
@@ -26,6 +27,14 @@ VARIANT_DESCRIPTIONS = {
     "B-VDPO": (
         "VDPO score-weighted segment-density core plus the Method B structural "
         "coherence term."
+    ),
+    "B_norm-DPO": (
+        "Standard DPO response core plus Method B Plackett-Luce structural coherence "
+        "over score-weighted per-token mean segment log-ratios."
+    ),
+    "B_norm-VDPO": (
+        "VDPO score-weighted segment-density core plus Method B Plackett-Luce structural "
+        "coherence over score-weighted per-token mean segment log-ratios."
     ),
     "C-DPO": (
         "Standard DPO response core plus Method A's score-gap-weighted, "
@@ -44,6 +53,13 @@ VARIANT_FORMULAS = {
     "B-VDPO": (
         "O(y) = beta * sum_s(score_s * h_s / length_s) / sum_s(score_s) "
         "+ PL(score_s * beta * h_s)"
+    ),
+    "B_norm-DPO": (
+        "O(y) = beta * sum_s h_s + PL(score_s * beta * h_s / length_s)"
+    ),
+    "B_norm-VDPO": (
+        "O(y) = beta * sum_s(score_s * h_s / length_s) / sum_s(score_s) "
+        "+ PL(score_s * beta * h_s / length_s)"
     ),
     "C-DPO": (
         "O(y) = beta * sum_s h_s "
@@ -539,9 +555,10 @@ def response_terms(
     scores = segment_scores[order].to(ell_policy.dtype)
     lengths = segment_lengths[order].to(ell_policy.dtype).clamp_min(1.0)
     h = ell_policy - ell_reference
+    h_bar = h / lengths
 
     standard_core = beta * h.sum()
-    vdpo_core = beta * (scores * (h / lengths)).sum() / scores.sum().clamp_min(eps)
+    vdpo_core = beta * (scores * h_bar).sum() / scores.sum().clamp_min(eps)
     method_a_omega_utility = omega_weighted_pl_log_ratio_ordered(
         beta * ell_policy,
         beta * ell_reference,
@@ -549,11 +566,13 @@ def response_terms(
         eps=eps,
     )
     method_b_log_sc = pl_log_prob_ordered(scores * beta * h)
+    method_b_norm_log_sc = pl_log_prob_ordered(scores * beta * h_bar)
     return {
         "standard_core": standard_core,
         "vdpo_core": vdpo_core,
         "method_a_omega_utility": method_a_omega_utility,
         "method_b_log_sc": method_b_log_sc,
+        "method_b_norm_log_sc": method_b_norm_log_sc,
     }
 
 
@@ -584,6 +603,10 @@ def response_objective(
         return terms["standard_core"] + terms["method_b_log_sc"]
     if variant == "B-VDPO":
         return terms["vdpo_core"] + terms["method_b_log_sc"]
+    if variant == "B_norm-DPO":
+        return terms["standard_core"] + terms["method_b_norm_log_sc"]
+    if variant == "B_norm-VDPO":
+        return terms["vdpo_core"] + terms["method_b_norm_log_sc"]
     if variant == "C-DPO":
         return terms["standard_core"] + terms["method_a_omega_utility"]
     if variant == "C-VDPO":
@@ -669,6 +692,26 @@ def run_loss_self_tests() -> dict[str, Any]:
     total.backward()
     if policy.grad is None or not torch.isfinite(policy.grad).all() or policy.grad.abs().sum() == 0:
         raise AssertionError("Structured losses did not produce finite non-zero gradients")
+
+    ordered = torch.argsort(ranks[0], stable=True)
+    ordered_h = (policy.detach()[0] - reference[0])[ordered]
+    ordered_scores = scores[0][ordered]
+    ordered_lengths = lengths[0][ordered]
+    expected_normalized_sc = pl_log_prob_ordered(
+        ordered_scores * 0.1 * ordered_h / ordered_lengths
+    )
+    normalized_terms = response_terms(
+        policy.detach()[0],
+        reference[0],
+        scores[0],
+        ranks[0],
+        lengths[0],
+        beta=0.1,
+    )
+    if not torch.allclose(
+        normalized_terms["method_b_norm_log_sc"], expected_normalized_sc, atol=1e-7
+    ):
+        raise AssertionError("Normalized Method B must divide every segment h by its token count")
 
     for variant in ("DPO", "A", "C-DPO", "C-VDPO"):
         loss, chosen, rejected, margin = structured_pair_loss(

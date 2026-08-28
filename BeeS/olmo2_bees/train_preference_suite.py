@@ -935,7 +935,19 @@ def run_train(args: argparse.Namespace) -> None:
                 self.vocabulary_shards.append(shard)
                 self.vocabulary_offsets.append(start)
 
-        def forward(self, hidden_states, labels, reference_support_ids=None):
+        def forward(
+            self,
+            hidden_states,
+            labels=None,
+            reference_support_ids=None,
+            maximum_only=False,
+        ):
+            if maximum_only:
+                if labels is not None or reference_support_ids is not None:
+                    raise ValueError("maximum_only does not accept labels or reference support")
+                return self.maximum_logit(hidden_states)
+            if labels is None:
+                raise ValueError("labels are required for token log-probability projection")
             selected_logits = torch.zeros_like(hidden_states[..., 0], dtype=torch.float32)
             support_selected_logits = (
                 torch.zeros(
@@ -994,13 +1006,16 @@ def run_train(args: argparse.Namespace) -> None:
                             support_selected * support_belongs,
                         )
 
+                    # TIDPO's extra support output keeps this checkpoint region live across the
+                    # later importance and anchor forwards. On FSDP2, its backward recomputation
+                    # can then observe a resharded DTensor weight with a plain saved activation.
+                    # Compute this one projection directly; activation offloading still moves its
+                    # saved tensors to host RAM, and the T4s have ample headroom for one shard.
                     shard_normalizer, shard_selected, shard_support_selected = (
-                        activation_checkpoint(
-                            project_and_reduce_support,
+                        project_and_reduce_support(
                             hidden_states,
                             labels,
                             reference_support_ids,
-                            use_reentrant=False,
                         )
                     )
                     support_selected_logits = support_selected_logits + shard_support_selected
@@ -1423,7 +1438,10 @@ def run_train(args: argparse.Namespace) -> None:
                 outputs.last_hidden_state.shape[0], device=outputs.last_hidden_state.device
             )
             last_hidden = outputs.last_hidden_state[batch_indices, last_positions]
-            return self.lm_head.maximum_logit(last_hidden)
+            # Invoke the module through __call__/forward so FSDP2 runs the parent head's
+            # pre/post-forward hooks. Calling maximum_logit() directly bypassed those hooks and
+            # left the nested vocabulary shards resharded before the main loss backward.
+            return self.lm_head(last_hidden, maximum_only=True)
         hidden_states = outputs.last_hidden_state[..., :-1, :]
         return self.lm_head(hidden_states, preference_labels, reference_support_ids)
 
@@ -1598,6 +1616,8 @@ def run_train(args: argparse.Namespace) -> None:
                     "kind": "reference_topk_plus_remainder_bucket_lower_bound",
                     "top_k": args.tidpo_kl_top_k,
                     "exact_full_vocabulary": False,
+                    "support_projection_activation_checkpointing": False,
+                    "support_projection_activation_offloading": args.activation_offloading,
                     "reason": "avoid a resident full reference model during full-parameter training",
                 },
                 "tidpo_importance_normalization": (

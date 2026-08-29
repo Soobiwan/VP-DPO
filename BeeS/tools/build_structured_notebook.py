@@ -6,7 +6,7 @@ import nbformat as nbf
 
 
 WORKSPACE = Path(__file__).resolve().parents[2]
-OUTPUT = WORKSPACE / "olmo_bees_all_methods_dual_gpu.ipynb"
+OUTPUT = WORKSPACE / "notebooks/local/olmo_bees_all_methods_dual_gpu.ipynb"
 
 
 def markdown(text: str):
@@ -127,8 +127,8 @@ so five fully restartable runs can require hundreds of gigabytes.
             r"""
 MODEL_ID = "allenai/OLMo-2-0425-1B-SFT"
 MODEL_REVISION = "0d85a3d037876ce6ac7d4311d994400fc66ac27f"
-SOURCE_JSONL = WORKSPACE / "ultrafeedback_bees_olmo2_1b_segmented_final.jsonl"
-SOURCE_MANIFEST = WORKSPACE / "ultrafeedback_bees_olmo2_1b_segmented_final.manifest.json"
+SOURCE_JSONL = WORKSPACE / "data/processed/ultrafeedback_bees_olmo2_1b_segmented_final.jsonl"
+SOURCE_MANIFEST = WORKSPACE / "data/processed/ultrafeedback_bees_olmo2_1b_segmented_final.manifest.json"
 
 MAX_LENGTH = 1024
 VARIANTS_TO_RUN = list(REQUESTED_VARIANTS)

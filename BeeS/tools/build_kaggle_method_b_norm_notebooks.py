@@ -7,7 +7,8 @@ from textwrap import dedent
 
 
 ROOT = Path(__file__).resolve().parents[2]
-TEMPLATE = ROOT / "olmo_bees_sampo_kaggle_t4x2.ipynb"
+NOTEBOOK_DIR = ROOT / "notebooks/kaggle"
+TEMPLATE = NOTEBOOK_DIR / "olmo_bees_sampo_kaggle_t4x2.ipynb"
 
 NOTEBOOKS = (
     {
@@ -711,7 +712,7 @@ def build_notebook(template: dict, config: dict[str, str]) -> dict:
 def main() -> None:
     template = json.loads(TEMPLATE.read_text(encoding="utf-8"))
     for config in NOTEBOOKS:
-        output = ROOT / config["filename"]
+        output = NOTEBOOK_DIR / config["filename"]
         notebook = build_notebook(template, config)
         output.write_text(
             json.dumps(notebook, ensure_ascii=False, indent=1) + "\n",

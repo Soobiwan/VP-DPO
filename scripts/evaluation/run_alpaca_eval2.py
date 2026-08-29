@@ -11,10 +11,10 @@ from pathlib import Path
 from typing import Any
 
 
-WORKSPACE_ROOT = Path(__file__).resolve().parent
+WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_APPROVAL = WORKSPACE_ROOT / "artifacts/olmo2_bees/approved_model.json"
 DEFAULT_MODEL = WORKSPACE_ROOT / "artifacts/olmo2_bees/olmo2_1b_dpo_full/final"
-DEFAULT_NOTEBOOK = WORKSPACE_ROOT / "alpaca-eval-2-judge.ipynb"
+DEFAULT_NOTEBOOK = WORKSPACE_ROOT / "notebooks/evaluation/alpaca-eval-2-judge.ipynb"
 DEFAULT_OUTPUT = WORKSPACE_ROOT / "artifacts/olmo2_bees/alpaca_eval2/model_outputs.json"
 
 # Keep package and model caches inside the workspace, consistent with the OLMo notebooks.

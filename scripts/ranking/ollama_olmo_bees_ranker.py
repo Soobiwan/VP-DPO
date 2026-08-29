@@ -252,7 +252,7 @@ def load_kaggle_prompt_templates(
     path = (
         Path(notebook_path).expanduser().resolve()
         if notebook_path is not None
-        else Path(__file__).resolve().with_name("kaggle_ranking.ipynb")
+        else Path(__file__).resolve().parents[2] / "notebooks/kaggle/kaggle_ranking.ipynb"
     )
     if not path.is_file():
         raise FileNotFoundError(

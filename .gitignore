@@ -45,7 +45,7 @@ wandb/
 *.gguf
 *.arrow
 
-# Curated top-level BeeS JSONL datasets are intentionally tracked in Git.
+# Curated BeeS JSONL datasets under data/processed/ are intentionally tracked in Git.
 
 # Logs and temporary files
 *.log

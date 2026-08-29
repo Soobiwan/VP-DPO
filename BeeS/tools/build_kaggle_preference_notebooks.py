@@ -6,6 +6,7 @@ from textwrap import dedent
 
 
 ROOT = Path(__file__).resolve().parents[2]
+NOTEBOOK_DIR = ROOT / "notebooks/kaggle"
 MODEL_ID = "allenai/OLMo-2-0425-1B-SFT"
 MODEL_REVISION = "0d85a3d037876ce6ac7d4311d994400fc66ac27f"
 
@@ -801,7 +802,7 @@ def build_notebook(method: str, config: dict) -> dict:
 
 def main() -> None:
     for method, config in METHODS.items():
-        destination = ROOT / config["filename"]
+        destination = NOTEBOOK_DIR / config["filename"]
         notebook = build_notebook(method, config)
         for index, cell in enumerate(notebook["cells"]):
             if cell["cell_type"] == "code":

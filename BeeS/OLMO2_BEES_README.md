@@ -22,12 +22,13 @@ The two notebooks in `notebooks/` implement the complete local workflow:
    - evaluates held-out preferences and a mandatory five-task `lm-eval` suite, and refuses to mark the
    model approved if the configured regression gate fails.
 
-The workspace root also contains two experiment notebooks built on the same prepared segmented
+The organized notebook folders also contain experiments built on the same prepared segmented
 split and memory-validated OLMo/FSDP2 path:
 
-- `olmo_bees_all_methods_dual_gpu.ipynb` trains the five segment-structured variants.
-- `olmo_bees_tidpo_kaggle_t4x2.ipynb`, `olmo_bees_simpo_kaggle_t4x2.ipynb`, and
-  `olmo_bees_sampo_kaggle_t4x2.ipynb` are independent Kaggle T4 x2 workflows. Each persists only
+- `../notebooks/local/olmo_bees_all_methods_dual_gpu.ipynb` trains the five segment-structured variants.
+- `../notebooks/kaggle/olmo_bees_tidpo_kaggle_t4x2.ipynb`,
+  `../notebooks/kaggle/olmo_bees_simpo_kaggle_t4x2.ipynb`, and
+  `../notebooks/kaggle/olmo_bees_sampo_kaggle_t4x2.ipynb` are independent Kaggle T4 x2 workflows. Each persists only
   one final FP32 model; prepared data, model/package caches, reference statistics, rank shards, and
   transient optimizer state stay in `/kaggle/temp` and are deleted after use. Training and
   evaluation are separate selectable sessions so neither silently overruns Kaggle's runtime or

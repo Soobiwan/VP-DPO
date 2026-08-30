@@ -137,8 +137,10 @@ def tidpo_importance_weights(
 ):
     """Reproduce the pinned TIDPO repo's gradient/Gaussian weight mixture.
 
-    The imported implementation normalizes the mixed weights to have mean one over response
-    tokens. This preserves the scale of an ordinary token-summed DPO margin.
+    The imported implementation normalizes the mixed weights to have mean one over whichever
+    valid-token mask it receives. Its main TI-DPO forward passes the full non-padding sequence,
+    then shifts and applies those weights only at labeled response positions. This preserves the
+    scale of an ordinary token-summed DPO margin over the normalized span.
     """
     import torch
 
@@ -169,6 +171,82 @@ def tidpo_importance_weights(
         mixed = mixed / mixed.sum()
         weights[row, valid] = mixed * float(count)
     return weights
+
+
+def paper_tidpo_importance_weights(
+    importances,
+    completion_mask,
+    *,
+    lambda_importance: float = 0.7,
+    prior_sigma_div: float = 4.0,
+):
+    """TI-DPO v3 Eqs. 6-8: L1 attribution mixed with a centered Gaussian prior.
+
+    Raw response-token attributions are sum-normalized.  The Gaussian remains in the unnormalized
+    form printed in Eq. 7 before the Eq. 8 convex mixture.  Unlike the pinned repository variant
+    above, this paper-equation path does not normalize the mixture or rescale it by response length.
+    """
+    import torch
+
+    if importances.shape != completion_mask.shape:
+        raise ValueError(f"Importance/mask mismatch: {importances.shape} vs {completion_mask.shape}")
+    if not 0.0 <= lambda_importance <= 1.0:
+        raise ValueError("lambda_importance must be in [0, 1]")
+    if prior_sigma_div <= 0.0:
+        raise ValueError("prior_sigma_div must be positive")
+    mask = completion_mask.to(torch.bool)
+    weights = torch.zeros_like(importances, dtype=torch.float32)
+    for row in range(importances.shape[0]):
+        valid = torch.nonzero(mask[row], as_tuple=False).squeeze(-1)
+        count = int(valid.numel())
+        if count == 0:
+            raise ValueError("Every row must have at least one valid token")
+        scores = importances[row, valid].detach().to(torch.float32).clamp_min(0.0)
+        score_sum = scores.sum()
+        if not torch.isfinite(scores).all() or not torch.isfinite(score_sum) or float(score_sum) <= 0:
+            raise ValueError("Paper TI-DPO requires positive finite gradient attributions")
+        normalized_scores = scores / score_sum
+        positions = torch.arange(count, dtype=torch.float32, device=importances.device)
+        center = (count - 1) / 2.0
+        sigma = count / float(prior_sigma_div)
+        prior = torch.exp(-0.5 * ((positions - center) / sigma) ** 2)
+        weights[row, valid] = (
+            float(lambda_importance) * normalized_scores
+            + (1.0 - float(lambda_importance)) * prior
+        )
+    return weights
+
+
+def paper_tidpo_pair_loss(
+    policy_token_logps,
+    reference_token_logps,
+    completion_mask,
+    importance_weights,
+    *,
+    beta: float = 0.1,
+    triplet_loss=None,
+    triplet_gamma: float = 0.1,
+):
+    """TI-DPO v3 Eqs. 11-14 without a TDPO position-KL extension."""
+    import torch
+    import torch.nn.functional as functional
+
+    mask, pair_count = _validate_pair_tensors(
+        policy_token_logps, completion_mask, reference_token_logps
+    )
+    if importance_weights.shape != policy_token_logps.shape:
+        raise ValueError("Paper TI-DPO importance weights must match token log-probabilities")
+    if torch.any(importance_weights[mask] < 0.0) or torch.any(importance_weights[mask] > 1.0):
+        raise ValueError("Paper TI-DPO importance weights must be in [0, 1]")
+    ratios = policy_token_logps - reference_token_logps.to(policy_token_logps.dtype)
+    scores = (ratios * importance_weights.to(ratios.dtype) * mask).sum(dim=-1)
+    chosen, rejected = scores[:pair_count], scores[pair_count:]
+    logits = float(beta) * (chosen - rejected)
+    base = -functional.logsigmoid(logits).mean()
+    if triplet_loss is None:
+        triplet_loss = torch.zeros((), device=base.device, dtype=base.dtype)
+    total = base + float(triplet_gamma) * triplet_loss
+    return total, chosen, rejected, logits, base, triplet_loss
 
 
 def tidpo_pair_loss(
@@ -215,8 +293,9 @@ def tidpo_pair_loss(
     if triplet_loss is None:
         triplet_loss = torch.zeros((), device=base.device, dtype=base.dtype)
     total = base + float(triplet_gamma) * triplet_loss
-    chosen_reward = chosen_margin + chosen_kl
-    rejected_reward = rejected_margin + rejected_kl
+    # Match gracefulning/TIDPO trainers.py::tdpo_loss exactly for reported rewards.
+    chosen_reward = float(beta) * (chosen_margin + chosen_kl).detach()
+    rejected_reward = float(beta) * (rejected_margin + rejected_kl).detach()
     return (
         total,
         chosen_reward,
@@ -362,6 +441,55 @@ def run_loss_self_tests() -> dict[str, Any]:
     expected_sums = mask.sum(-1).to(weights.dtype)
     if not torch.allclose(weights.sum(-1), expected_sums, atol=1e-6):
         raise AssertionError("TIDPO weights do not preserve mean-one scale")
+    expected_repo_weights = torch.zeros_like(weights)
+    for row in range(importances.shape[0]):
+        valid = torch.nonzero(mask[row], as_tuple=False).squeeze(-1)
+        count = int(valid.numel())
+        scores = importances[row, valid] / importances[row, valid].sum()
+        positions = torch.arange(count, dtype=torch.float32)
+        prior = torch.exp(
+            -0.5 * ((positions - (count - 1) / 2.0) / max(1.0, count / 8.0)) ** 2
+        )
+        prior = prior / prior.sum()
+        mixed = 0.2 * scores + 0.8 * prior
+        expected_repo_weights[row, valid] = mixed / mixed.sum() * count
+    if not torch.allclose(weights, expected_repo_weights, atol=1e-6):
+        raise AssertionError("Pinned-repository TI-DPO Gaussian importance mixture is incorrect")
+    paper_weights = paper_tidpo_importance_weights(importances, mask)
+    gaussian_edge_three = math.exp(-8.0 / 9.0)
+    gaussian_edge_two = math.exp(-0.5)
+    expected_paper_weights = torch.tensor(
+        [
+            [
+                0.7 / 7.0 + 0.3 * gaussian_edge_three,
+                0.7,
+                0.2 + 0.3 * gaussian_edge_three,
+                0.0,
+            ],
+            [
+                0.35 + 0.3 * gaussian_edge_three,
+                0.7 / 6.0 + 0.3,
+                0.7 / 3.0 + 0.3 * gaussian_edge_three,
+                0.0,
+            ],
+            [
+                0.7 * 2.0 / 3.0 + 0.3 * gaussian_edge_two,
+                0.7 / 3.0 + 0.3 * gaussian_edge_two,
+                0.0,
+                0.0,
+            ],
+            [
+                0.7 / 6.0 + 0.3 * gaussian_edge_three,
+                0.7 / 3.0 + 0.3,
+                0.35 + 0.3 * gaussian_edge_three,
+                0.0,
+            ],
+        ]
+    )
+    if not torch.allclose(paper_weights, expected_paper_weights, atol=1e-6):
+        raise AssertionError("Paper TI-DPO Eqs. 6-8 Gaussian hybrid weights are incorrect")
+    if torch.any(paper_weights[mask] < 0.0) or torch.any(paper_weights[mask] > 1.0):
+        raise AssertionError("Paper TI-DPO hybrid weights escaped [0, 1]")
 
     simpo = simpo_pair_loss(policy, mask)
     sampo_generator = torch.Generator().manual_seed(42)
@@ -400,6 +528,27 @@ def run_loss_self_tests() -> dict[str, Any]:
         weights,
         position_kl=position_kl,
     )
+    repo_scores = ((policy - reference) * weights * mask).sum(-1)
+    expected_repo_logits = 0.2 * (
+        repo_scores[:2]
+        - repo_scores[2:]
+        - 0.5 * (position_kl[2:] - position_kl[:2].detach())
+    )
+    if not torch.allclose(tidpo[3], expected_repo_logits, atol=1e-6):
+        raise AssertionError("Pinned-repository TI-DPO weighted TDPO2 logit is incorrect")
+    paper_tidpo = paper_tidpo_pair_loss(
+        policy,
+        reference,
+        mask,
+        paper_weights,
+        triplet_loss=torch.zeros((), dtype=policy.dtype),
+    )
+    expected_paper_scores = ((policy - reference) * expected_paper_weights * mask).sum(-1)
+    expected_paper_logits = 0.1 * (
+        expected_paper_scores[:2] - expected_paper_scores[2:]
+    )
+    if not torch.allclose(paper_tidpo[3], expected_paper_logits, atol=1e-6):
+        raise AssertionError("Paper TI-DPO Eqs. 11-12 weighted margin is incorrect")
     ratios = policy - reference
     triplet = packed_triplet_loss(
         ratios[2:],
@@ -409,7 +558,7 @@ def run_loss_self_tests() -> dict[str, Any]:
         ratios[2:],
         mask[2:],
     )
-    total = simpo[0] + sampo[0] + tidpo[0] + triplet
+    total = simpo[0] + sampo[0] + tidpo[0] + paper_tidpo[0] + triplet
     total.backward()
     if policy.grad is None or not torch.isfinite(policy.grad).all() or policy.grad.abs().sum() == 0:
         raise AssertionError("Preference-suite losses did not produce finite non-zero gradients")
@@ -421,12 +570,18 @@ def run_loss_self_tests() -> dict[str, Any]:
         "SimPO": float(simpo[0].detach()),
         "SamPO": float(sampo[0].detach()),
         "TIDPO": float(tidpo[0].detach()),
+        "TIDPO_paper_exact": float(paper_tidpo[0].detach()),
         "TIDPO_triplet": float(triplet.detach()),
         "TIDPO_topk_bucket_kl": position_kl.detach().tolist(),
         "TIDPO_projected_kl_below_exact": True,
+        "TIDPO_repo_tdpo2_formula_verified": True,
+        "TIDPO_repo_gaussian_importance_verified": True,
         "SamPO_sampled_counts": sampo[-1].tolist(),
     }
-    scalar_values = [outputs[key] for key in ("SimPO", "SamPO", "TIDPO", "TIDPO_triplet")]
+    scalar_values = [
+        outputs[key]
+        for key in ("SimPO", "SamPO", "TIDPO", "TIDPO_paper_exact", "TIDPO_triplet")
+    ]
     if not all(math.isfinite(value) for value in scalar_values):
         raise AssertionError(outputs)
     return outputs

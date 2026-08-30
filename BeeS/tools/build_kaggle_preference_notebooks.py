@@ -12,15 +12,55 @@ MODEL_REVISION = "0d85a3d037876ce6ac7d4311d994400fc66ac27f"
 
 METHODS = {
     "TIDPO": {
+        "display": "TI-DPO repository approximation",
         "filename": "olmo_bees_tidpo_kaggle_t4x2.ipynb",
-        "short": "TIDPO",
+        "short": "TI-DPO repository approximation",
         "reference_note": (
-            "TIDPO builds the full top-32 token reference projection and fixed anchors in scratch "
-            "storage, then deletes both rank JSONL shards immediately after the Arrow cache is "
-            "validated."
+            "This is the older memory-saving approximation, not the citation-grade official-repo "
+            "baseline: it uses a top-32-plus-remainder KL projection and fixed cached anchors. "
+            "Use `olmo_bees_tidpo_official_repo_exact_kaggle_t4x2.ipynb` when reporting TI-DPO."
         ),
         "top_k": 32,
         "anchors": True,
+    },
+    "TIDPOOfficialRepoExact": {
+        "method": "TIDPO",
+        "display": "TI-DPO official-repo exact",
+        "filename": "olmo_bees_tidpo_official_repo_exact_kaggle_t4x2.ipynb",
+        "short": "TI-DPO official-repo exact",
+        "reference_note": (
+            "This is the citation-grade TI-DPO baseline. It ports the objective from the pinned "
+            "[gracefulning/TIDPO repository](https://github.com/gracefulning/TIDPO/tree/"
+            "e04a0926869a8f9fe9c9e9ce395394fd2c697fe2) exactly: weighted TDPO2, exhaustive "
+            "full-vocabulary KL(ref||policy), full-sequence last-logit gradient/Gaussian token "
+            "weights, and a same-prompt anchor sampled live from the current policy. The notebook "
+            "hash-verifies the vendored upstream source and writes the commit, exactness flags, "
+            "and adapter hash into the training manifest. OLMo, BeeS data, optimizer, schedule, "
+            "precision, and FSDP2 are the shared controlled comparison recipe, so this is an exact "
+            "TI-DPO method port rather than a reproduction of the authors' Llama/Mistral runs."
+        ),
+        "top_k": 0,
+        "anchors": False,
+        "repo_exact": True,
+    },
+    "TIDPOPaperExact": {
+        "method": "TIDPO",
+        "display": "TI-DPO paper-exact",
+        "filename": "olmo_bees_tidpo_paper_exact_kaggle_t4x2.ipynb",
+        "short": "TI-DPO paper-exact",
+        "reference_note": (
+            "This variant follows [arXiv:2505.19653v3](https://arxiv.org/abs/2505.19653) "
+            "Eqs. 5-14 and Appendix B.5: last-logit L1 gradient attribution mixed with the "
+            "centered Gaussian prior, weighted DPO without a TDPO position-KL term, and an "
+            "intermediate response sampled live from the current policy. A frozen FP16 "
+            "reference model supplies exact selected-token log-probabilities during training; "
+            "there is no approximation cache. This ports the published objective and reported "
+            "objective hyperparameters to OLMo and this BeeS dataset; it does not claim to "
+            "reproduce the paper's Llama/Mistral checkpoints."
+        ),
+        "top_k": 0,
+        "anchors": False,
+        "paper_exact": True,
     },
     "SimPO": {
         "filename": "olmo_bees_simpo_kaggle_t4x2.ipynb",
@@ -64,23 +104,76 @@ def code(source: str) -> dict:
     }
 
 
-def build_notebook(method: str, config: dict) -> dict:
+def build_notebook(method_key: str, config: dict) -> dict:
+    method = config.get("method", method_key)
+    display = config.get("display", method)
+    paper_exact = bool(config.get("paper_exact", False))
+    repo_exact = bool(config.get("repo_exact", False))
+    live_tidpo = paper_exact or repo_exact
+    tidpo_variant = (
+        "official_repo_exact"
+        if repo_exact
+        else (
+            "paper_exact"
+            if paper_exact
+            else ("repository_approximation" if method == "TIDPO" else None)
+        )
+    )
+    needs_reference_stage = method != "SimPO" and not live_tidpo
     top_k = config["top_k"]
     anchors_flag = "--with-tidpo-anchors" if config["anchors"] else "--no-with-tidpo-anchors"
-    lower = method.lower()
-    next_step = (
-        "For TIDPO, first commit the default reference-only output and attach it to a new copy "
-        "of this notebook. Set `BUILD_REFERENCE_ONLY=False` and `RUN_TRAINING=True`. After that "
-        "training run, commit and attach the model output to an evaluation session."
-        if method == "TIDPO"
-        else
-        "After training, commit the model output and attach it to an evaluation copy of this "
-        "notebook. Set `RUN_TRAINING=False` and enable the desired evaluation switch."
+    lower = method_key.lower()
+    scope_note = (
+        "This notebook is training-only; paper evaluation belongs in a separate immutable-model "
+        "session."
+        if repo_exact
+        else "Evaluation runs after the trained model is attached as a read-only input."
     )
+    switch_note = (
+        "This citation-grade artifact has one executable phase: full training. The two evaluation "
+        "flags remain hard-disabled guards used by the shared storage code."
+        if repo_exact
+        else (
+            "Keep reference preparation, training, and evaluation in separate Kaggle sessions when "
+            "configured below. The notebook rejects incompatible phase combinations."
+        )
+    )
+    dataset_note = (
+        "This produces the validated 6,000-row training split used by the controlled OLMo run."
+        if repo_exact
+        else (
+            "This produces the same validated 6,000-row train and 1,891-row untouched test splits "
+            "as the combined notebook. It is skipped for an lm-eval-only session."
+        )
+    )
+    requirements_file = (
+        "requirements-olmo2-training.txt" if repo_exact else "requirements-olmo2.txt"
+    )
+    audited_packages = [
+        "torch", "transformers", "datasets", "accelerate", "trl", "bitsandbytes", "safetensors"
+    ]
+    if not repo_exact:
+        audited_packages.append("lm_eval")
+    if repo_exact:
+        next_step = (
+            "After training, commit this notebook output. The FP32 model and its hash-verified "
+            "`training_manifest.json` are the complete outputs of this training-only notebook."
+        )
+    elif method == "TIDPO" and not live_tidpo:
+        next_step = (
+            "For TIDPO, first commit the default reference-only output and attach it to a new copy "
+            "of this notebook. Set `BUILD_REFERENCE_ONLY=False` and `RUN_TRAINING=True`. After that "
+            "training run, commit and attach the model output to an evaluation session."
+        )
+    else:
+        next_step = (
+            "After training, commit the model output and attach it to an evaluation copy of this "
+            "notebook. Set `RUN_TRAINING=False` and enable the desired evaluation switch."
+        )
     cells = [
         markdown(
             f"""
-            # OLMo 2 1B — {method} on Kaggle T4 x2
+            # OLMo 2 1B — {display} on Kaggle T4 x2
 
             This standalone notebook trains one full-parameter `{MODEL_ID}` policy with **both**
             Kaggle T4 GPUs through FSDP2 full sharding. It keeps FP32 master weights and paged FP32
@@ -89,10 +182,10 @@ def build_notebook(method: str, config: dict) -> dict:
 
             Before running, choose **GPU T4 x2** under *Settings → Accelerator* and enable Internet,
             or attach this repository as a Kaggle Dataset input. Kaggle currently limits GPU notebook
-            sessions to 12 hours and persisted `/kaggle/working` output to 20 GB. SimPO and SamPO
-            train in their default session. TIDPO first persists its reusable top-k/anchor cache, then
-            trains in a second session with that cache attached. Evaluation likewise runs after the
-            trained model is attached as a read-only input.
+            sessions to 12 hours and persisted `/kaggle/working` output to 20 GB. The legacy
+            repository-approximation TIDPO notebook persists a reusable top-k/anchor cache. The
+            official-repo-exact and paper-exact TI-DPO variants train with a live frozen reference;
+            SimPO is reference-free. {scope_note}
 
             {config['reference_note']}
 
@@ -109,20 +202,21 @@ def build_notebook(method: str, config: dict) -> dict:
             """
         ),
         markdown(
-            """
+            f"""
             ## 1. Run switches
 
-            Keep reference preparation, training, and evaluation in separate Kaggle sessions when
-            configured below. The notebook rejects incompatible phase combinations.
+            {switch_note}
             """
         ),
         code(
             f"""
             METHOD = {method!r}
+            TIDPO_VARIANT = {tidpo_variant!r}
+            NEEDS_REFERENCE_STAGE = {needs_reference_stage}
 
             INSTALL_DEPENDENCIES = True
-            BUILD_REFERENCE_ONLY = {method == 'TIDPO'}
-            RUN_TRAINING = {method != 'TIDPO'}
+            BUILD_REFERENCE_ONLY = {method == 'TIDPO' and not live_tidpo}
+            RUN_TRAINING = {method != 'TIDPO' or live_tidpo}
             RUN_HELDOUT_EVAL = False
             RUN_LM_EVAL = False
 
@@ -131,6 +225,8 @@ def build_notebook(method: str, config: dict) -> dict:
 
             if BUILD_REFERENCE_ONLY and METHOD == "SimPO":
                 raise ValueError("SimPO is reference-free")
+            if BUILD_REFERENCE_ONLY and TIDPO_VARIANT in ("paper_exact", "official_repo_exact"):
+                raise ValueError("Exact TI-DPO variants use a live reference model, not a cache")
             if not any((BUILD_REFERENCE_ONLY, RUN_TRAINING, RUN_HELDOUT_EVAL, RUN_LM_EVAL)):
                 raise ValueError("Enable reference preparation, training, or evaluation")
             if BUILD_REFERENCE_ONLY and (RUN_TRAINING or RUN_HELDOUT_EVAL or RUN_LM_EVAL):
@@ -148,6 +244,7 @@ def build_notebook(method: str, config: dict) -> dict:
             f"""
             from pathlib import Path
             import gc
+            import hashlib
             import json
             import os
             import shutil
@@ -155,6 +252,11 @@ def build_notebook(method: str, config: dict) -> dict:
             import sys
             import tempfile
             import time
+
+
+            def normalized_source_sha256(path: Path) -> str:
+                content = path.read_bytes().replace(b"\\r\\n", b"\\n")
+                return hashlib.sha256(content).hexdigest()
 
 
             ON_KAGGLE = Path("/kaggle").is_dir()
@@ -194,7 +296,20 @@ def build_notebook(method: str, config: dict) -> dict:
                 SOURCE_REPO = clone_target
 
             PROJECT_ROOT = SOURCE_REPO / "BeeS"
-            requirements = PROJECT_ROOT / "requirements-olmo2.txt"
+            requirements = PROJECT_ROOT / {requirements_file!r}
+            if TIDPO_VARIANT == "official_repo_exact":
+                expected_adapter_hash = (
+                    "bcf8c44c9ae22ad898299edf70c42ac11f3595ecedd8e521c918af86e454eeb6"
+                )
+                actual_adapter_hash = normalized_source_sha256(
+                    PROJECT_ROOT / "olmo2_bees" / "train_preference_suite.py"
+                )
+                if actual_adapter_hash != expected_adapter_hash:
+                    raise RuntimeError(
+                        "This checkout does not contain the audited official-repo-exact OLMo "
+                        f"adapter: expected {{expected_adapter_hash}}, got {{actual_adapter_hash}}. "
+                        "Attach the repository snapshot shipped with this notebook."
+                    )
             if INSTALL_DEPENDENCIES:
                 subprocess.check_call([
                     sys.executable, "-m", "pip", "install", "--quiet", "--upgrade",
@@ -233,10 +348,7 @@ def build_notebook(method: str, config: dict) -> dict:
 
             print("Repository:", SOURCE_REPO)
             print("Source dataset:", SOURCE_JSONL)
-            print(json.dumps(package_versions([
-                "torch", "transformers", "datasets", "accelerate", "trl",
-                "bitsandbytes", "safetensors", "lm_eval",
-            ]), indent=2))
+            print(json.dumps(package_versions({audited_packages!r}), indent=2))
             """
         ),
         markdown("## 3. Kaggle T4 x2 and host-resource audit"),
@@ -273,20 +385,42 @@ def build_notebook(method: str, config: dict) -> dict:
             SAVE_STEPS = 0  # mandatory on Kaggle: final model only, no optimizer/FSDP restart state
             SEED = 42
 
-            TIDPO_BETA = 0.2
+            TIDPO_BETA = {0.1 if paper_exact else 0.2}
             TIDPO_ALPHA = 0.5
-            TIDPO2 = True
+            TIDPO2 = {not paper_exact}
             TIDPO_KL_TOP_K = {top_k}
-            TIDPO_LAMBDA_IMPORTANCE = 0.2
-            TIDPO_PRIOR_SIGMA_DIV = 8.0
-            TIDPO_TRIPLET_GAMMA = 0.001
-            TIDPO_TRIPLET_MARGIN = 0.001
+            TIDPO_LAMBDA_IMPORTANCE = {0.7 if paper_exact else 0.2}
+            TIDPO_PRIOR_SIGMA_DIV = {4.0 if paper_exact else 8.0}
+            TIDPO_TRIPLET_GAMMA = {0.1 if paper_exact else 0.001}
+            TIDPO_TRIPLET_MARGIN = {0.5 if paper_exact else 0.001}
             ANCHOR_MAX_NEW_TOKENS = 64
+            ANCHOR_TOP_K = 50
+            ANCHOR_TOP_P = 0.95
+            ANCHOR_TEMPERATURE = 0.8
             SIMPO_BETA = 2.0
             SIMPO_GAMMA_BETA_RATIO = 0.5
             SAMPO_BETA = 0.1
 
             assert SAVE_STEPS == 0, "Kaggle output cannot safely retain full FSDP optimizer checkpoints"
+
+            if TIDPO_VARIANT == "official_repo_exact":
+                upstream_root = SOURCE_REPO / "third_party" / "TIDPO"
+                upstream = json.loads((upstream_root / "UPSTREAM.json").read_text())
+                assert upstream["repository"] == "https://github.com/gracefulning/TIDPO"
+                assert upstream["commit"] == "e04a0926869a8f9fe9c9e9ce395394fd2c697fe2"
+                expected_upstream_hashes = (
+                    (
+                        "trainers.py",
+                        "5fb907eecc2d00a6b97d7ac45db4bd86ce4d58197b7a58363233e40040ae113f",
+                    ),
+                    (
+                        "config/loss/tidpo.yaml",
+                        "e77343adb00fa27a0d54d9c806a12510291b2c779be1639ea5e86da74149a1e8",
+                    ),
+                )
+                for relative, expected_hash in expected_upstream_hashes:
+                    assert normalized_source_sha256(upstream_root / relative) == expected_hash
+                print("Verified pinned TI-DPO source:", upstream["commit"])
 
             if ON_KAGGLE:
                 PERSIST_ROOT = Path("/kaggle/working") / "olmo2_bees_{lower}"
@@ -347,6 +481,10 @@ def build_notebook(method: str, config: dict) -> dict:
                 manifest = json.loads(manifest_path.read_text())
                 return (
                     manifest.get("method") == METHOD
+                    and (
+                    manifest.get("tidpo_variant")
+                        or ("repository_approximation" if METHOD == "TIDPO" else None)
+                    ) == TIDPO_VARIANT
                     and manifest.get("model_revision") == MODEL_REVISION
                     and manifest.get("world_size") == 2
                     and manifest.get("restart_checkpoints_enabled") is False
@@ -363,8 +501,26 @@ def build_notebook(method: str, config: dict) -> dict:
             )
             print(json.dumps({{
                 "method": METHOD,
-                "formula": METHOD_FORMULAS[METHOD],
-                "description": METHOD_DESCRIPTIONS[METHOD],
+                "tidpo_variant": TIDPO_VARIANT,
+                "formula": (
+                    "Pinned repo: full-sequence weighted TDPO2 with exact full-vocabulary "
+                    "KL(ref||policy) + live-anchor triplet"
+                    if TIDPO_VARIANT == "official_repo_exact"
+                    else (
+                        "TI-DPO v3 Eqs. 5-14: gradient/Gaussian-weighted DPO + live-anchor triplet"
+                        if TIDPO_VARIANT == "paper_exact"
+                        else METHOD_FORMULAS[METHOD]
+                    )
+                ),
+                "description": (
+                    "Exact objective port of gracefulning/TIDPO commit e04a092 to OLMo"
+                    if TIDPO_VARIANT == "official_repo_exact"
+                    else (
+                        "TI-DPO paper-equation variant from arXiv:2505.19653v3"
+                        if TIDPO_VARIANT == "paper_exact"
+                        else METHOD_DESCRIPTIONS[METHOD]
+                    )
+                ),
                 "scratch": str(SCRATCH_ROOT),
                 "persisted_output": str(PERSIST_ROOT),
                 "build_reference_only": BUILD_REFERENCE_ONLY,
@@ -383,11 +539,10 @@ def build_notebook(method: str, config: dict) -> dict:
             """
         ),
         markdown(
-            """
+            f"""
             ## 6. Prepare the lossless segmented dataset in scratch space
 
-            This produces the same validated 6,000-row train and 1,891-row untouched test splits as
-            the combined notebook. It is skipped for an lm-eval-only session.
+            {dataset_note}
             """
         ),
         code(
@@ -415,7 +570,7 @@ def build_notebook(method: str, config: dict) -> dict:
                 print("Prepared dataset is not needed for this phase")
             """
         ),
-        markdown(f"## 7. {method} reference stage"),
+        markdown(f"## 7. {display} reference stage"),
         code(
             f"""
             def find_attached_reference_cache() -> Path | None:
@@ -441,7 +596,7 @@ def build_notebook(method: str, config: dict) -> dict:
                 return candidates[0] if candidates else None
 
 
-            if RUN_TRAINING and not TRAIN_ALREADY_COMPLETE and METHOD == "TIDPO":
+            if RUN_TRAINING and not TRAIN_ALREADY_COMPLETE and NEEDS_REFERENCE_STAGE and METHOD == "TIDPO":
                 attached_cache = find_attached_reference_cache()
                 if attached_cache is None:
                     raise FileNotFoundError(
@@ -453,7 +608,7 @@ def build_notebook(method: str, config: dict) -> dict:
                 print("Using attached read-only TIDPO reference cache:", REFERENCE_CACHE)
             elif (
                 (BUILD_REFERENCE_ONLY or (RUN_TRAINING and not TRAIN_ALREADY_COMPLETE))
-                and METHOD != "SimPO"
+                and NEEDS_REFERENCE_STAGE
             ):
                 reference_command = [
                     sys.executable, "-m", "accelerate.commands.launch",
@@ -486,15 +641,15 @@ def build_notebook(method: str, config: dict) -> dict:
                     part.unlink()
                     print("Deleted merged rank shard:", part)
                 print("Reference cache GiB:", round(tree_size_gib(REFERENCE_CACHE), 3))
-            elif METHOD == "SimPO":
-                print("SimPO is reference-free; no reference model pass or cache is created")
+            elif not NEEDS_REFERENCE_STAGE:
+                print("No approximation reference-cache stage is required for this variant")
             else:
                 print("Reference stage not needed")
             """
         ),
         markdown(
             f"""
-            ## 8. Train {method} with both T4 GPUs
+            ## 8. Train {display} with both T4 GPUs
 
             `SAVE_STEPS=0` prevents FSDP weights and paged optimizer states from ever being written
             as restart checkpoints. The trainer saves only the consolidated FP32 final model.
@@ -516,6 +671,7 @@ def build_notebook(method: str, config: dict) -> dict:
                     "--model-id", MODEL_ID,
                     "--model-revision", MODEL_REVISION,
                     "--output-dir", str(RUN_DIR),
+                    "--max-length", str(MAX_LENGTH),
                     "--run-name", f"kaggle-olmo2-bees-{METHOD.lower()}",
                     "--method", METHOD,
                     "--epochs", str(EPOCHS),
@@ -531,12 +687,18 @@ def build_notebook(method: str, config: dict) -> dict:
                     "--tidpo-prior-sigma-div", str(TIDPO_PRIOR_SIGMA_DIV),
                     "--tidpo-triplet-gamma", str(TIDPO_TRIPLET_GAMMA),
                     "--tidpo-triplet-margin", str(TIDPO_TRIPLET_MARGIN),
+                    "--tidpo-anchor-max-new-tokens", str(ANCHOR_MAX_NEW_TOKENS),
+                    "--tidpo-anchor-top-k", str(ANCHOR_TOP_K),
+                    "--tidpo-anchor-top-p", str(ANCHOR_TOP_P),
+                    "--tidpo-anchor-temperature", str(ANCHOR_TEMPERATURE),
                     "--simpo-beta", str(SIMPO_BETA),
                     "--simpo-gamma-beta-ratio", str(SIMPO_GAMMA_BETA_RATIO),
                     "--sampo-beta", str(SAMPO_BETA),
                     "--tidpo2" if TIDPO2 else "--no-tidpo2",
+                    "--tidpo-paper-exact" if TIDPO_VARIANT == "paper_exact" else "--no-tidpo-paper-exact",
+                    "--tidpo-repo-exact" if TIDPO_VARIANT == "official_repo_exact" else "--no-tidpo-repo-exact",
                 ]
-                if METHOD != "SimPO":
+                if NEEDS_REFERENCE_STAGE:
                     command.extend(["--reference-cache", str(REFERENCE_CACHE)])
                 run_streaming(command, cwd=PROJECT_ROOT)
             elif RUN_TRAINING:
@@ -565,7 +727,14 @@ def build_notebook(method: str, config: dict) -> dict:
                         except (OSError, json.JSONDecodeError):
                             continue
                         candidate = manifest_path.parent / "final"
-                        if manifest.get("method") == method and candidate.is_dir():
+                        if (
+                            manifest.get("method") == method
+                            and (
+                                manifest.get("tidpo_variant")
+                                or ("repository_approximation" if method == "TIDPO" else None)
+                            ) == TIDPO_VARIANT
+                            and candidate.is_dir()
+                        ):
                             candidates.append((candidate, manifest_path))
                 if not candidates:
                     raise FileNotFoundError(
@@ -588,6 +757,10 @@ def build_notebook(method: str, config: dict) -> dict:
                 POLICY_MODEL, TRAINING_MANIFEST_PATH = attached_final_model(METHOD)
                 training_manifest = json.loads(TRAINING_MANIFEST_PATH.read_text())
                 assert training_manifest["method"] == METHOD
+                assert (
+                    training_manifest.get("tidpo_variant")
+                    or ("repository_approximation" if METHOD == "TIDPO" else None)
+                ) == TIDPO_VARIANT
                 assert training_manifest["full_parameter_training"] is True
                 assert training_manifest["peft_or_lora"] is False
                 assert training_manifest["weight_quantization"] is None
@@ -597,6 +770,50 @@ def build_notebook(method: str, config: dict) -> dict:
                 assert training_manifest["parallelism"] == "FSDP2_FULL_SHARD"
                 assert training_manifest["world_size"] == 2
                 assert training_manifest["restart_checkpoints_enabled"] is False
+                if TIDPO_VARIANT == "official_repo_exact":
+                    assert training_manifest["tidpo_fidelity"] == "official_repository_objective_exact"
+                    assert training_manifest["tidpo_upstream_commit"] == (
+                        "e04a0926869a8f9fe9c9e9ce395394fd2c697fe2"
+                    )
+                    assert training_manifest["tidpo_position_kl"] == {
+                        "kind": "exact_full_vocabulary_reference_to_policy",
+                        "top_k": None,
+                        "exact_full_vocabulary": True,
+                        "support_projection_activation_checkpointing": None,
+                        "support_projection_activation_offloading": None,
+                        "reason": (
+                            "Pinned repository TDPO2 computes KL(ref||policy) over every "
+                            "vocabulary token"
+                        ),
+                    }
+                    assert training_manifest["tidpo_live_policy_anchor"] is True
+                    assert training_manifest["tidpo_fixed_anchor_cache"] is False
+                    assert training_manifest["tidpo_official_defaults_enforced"] is True
+                    assert training_manifest["tidpo_official_objective"] == {
+                        "base": "weighted_tdpo2",
+                        "beta": 0.2,
+                        "alpha": 0.5,
+                        "if_tdpo2": True,
+                        "position_kl_direction": "KL(reference||policy)",
+                        "position_kl_vocabulary": "full",
+                        "triplet_gamma": 0.001,
+                        "triplet_margin": 0.001,
+                    }
+                    assert training_manifest["tidpo_official_importance"]["gaussian_sigma"] == (
+                        "max(1, valid_token_count/8)"
+                    )
+                    assert training_manifest["tidpo_official_importance"][
+                        "normalization_scope"
+                    ] == "all_nonpadding_prompt_and_response_tokens"
+                    assert training_manifest["tidpo_official_anchor"]["source"] == (
+                        "current_policy_same_prompt_live"
+                    )
+                    assert training_manifest["tidpo_source_evidence"]["commit"] == (
+                        "e04a0926869a8f9fe9c9e9ce395394fd2c697fe2"
+                    )
+                    assert training_manifest["tidpo_source_evidence"][
+                        "olmo_adapter_normalized_source_sha256"
+                    ] == "bcf8c44c9ae22ad898299edf70c42ac11f3595ecedd8e521c918af86e454eeb6"
                 for filename, digest in training_manifest["weight_files_sha256"].items():
                     assert sha256_file(POLICY_MODEL / filename) == digest
                 print("Verified policy:", POLICY_MODEL)
@@ -692,6 +909,7 @@ def build_notebook(method: str, config: dict) -> dict:
 
             summary = {
                 "method": METHOD,
+                "tidpo_variant": TIDPO_VARIANT,
                 "phase": "reference" if BUILD_REFERENCE_ONLY else (
                     "training" if RUN_TRAINING else "evaluation"
                 ),
@@ -738,7 +956,9 @@ def build_notebook(method: str, config: dict) -> dict:
             print(json.dumps(summary, indent=2))
             """
         ),
-        markdown("## 13. Final cleanup and Kaggle output-budget assertion"),
+        markdown(
+            f"## {10 if repo_exact else 13}. Final cleanup and Kaggle output-budget assertion"
+        ),
         code(
             """
             delete_training_transients()
@@ -770,11 +990,60 @@ def build_notebook(method: str, config: dict) -> dict:
             Use **Save Version → Save & Run All** after each completed phase. {next_step}
 
             Attached caches and models remain read-only under `/kaggle/input`; the next phase writes
-            only its own output, so the {method} FP32 checkpoint is never duplicated into
+            only its own output, so the {display} FP32 checkpoint is never duplicated into
             `/kaggle/working`.
             """
         ),
     ]
+    if repo_exact:
+        # The requested citation-grade artifact is deliberately training-only. Evals belong in a
+        # separate paper evaluation notebook/session and must not mutate or obscure this run.
+        filtered_cells = []
+        skip_next_code = False
+        replace_next_reference_code = False
+        for cell in cells:
+            source = "".join(cell["source"])
+            if cell["cell_type"] == "markdown" and source.startswith("## 7."):
+                filtered_cells.append(
+                    markdown(
+                        """
+                        ## 7. Live frozen reference (no approximation cache)
+
+                        The exact full-vocabulary reference distribution is computed online for
+                        every labeled position. The same frozen base model also scores the live
+                        current-policy anchor. No top-k projection or fixed-anchor cache is built.
+                        """
+                    )
+                )
+                replace_next_reference_code = True
+                continue
+            if replace_next_reference_code and cell["cell_type"] == "code":
+                filtered_cells.append(
+                    code(
+                        """
+                        assert NEEDS_REFERENCE_STAGE is False
+                        assert TIDPO_KL_TOP_K == 0
+                        print("Exact online reference enabled; no approximation cache is used")
+                        """
+                    )
+                )
+                replace_next_reference_code = False
+                continue
+            if cell["cell_type"] == "markdown" and source.startswith(
+                (
+                    "## 10. Optional held-out",
+                    "## 11. Optional deterministic lm-eval",
+                    "## 12. Write the available evidence",
+                )
+            ):
+                skip_next_code = True
+                continue
+            if skip_next_code and cell["cell_type"] == "code":
+                skip_next_code = False
+                continue
+            filtered_cells.append(cell)
+        cells = filtered_cells
+
     for index, cell in enumerate(cells):
         cell["id"] = f"{lower}-{index:02d}"
     return {

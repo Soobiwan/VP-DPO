@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import functools
+import hashlib
 import json
 import math
 import os
 import tempfile
 from pathlib import Path
 from types import MethodType
-from typing import Any
+from typing import Any, Tuple
 
 from .common import configure_workspace, package_versions, sha256_file, write_json
 from .preference_suite_losses import (
@@ -16,6 +18,8 @@ from .preference_suite_losses import (
     METHOD_FORMULAS,
     METHODS,
     packed_triplet_loss,
+    paper_tidpo_importance_weights,
+    paper_tidpo_pair_loss,
     run_loss_self_tests,
     sampo_pair_loss,
     simpo_pair_loss,
@@ -30,6 +34,224 @@ VOCABULARY_SHARD_SIZE = 8192
 REFERENCE_PROJECTION_CHUNK_SIZE = 64
 TIDPO_REPOSITORY = "https://github.com/gracefulning/TIDPO"
 TIDPO_COMMIT = "e04a0926869a8f9fe9c9e9ce395394fd2c697fe2"
+TIDPO_UPSTREAM_SOURCE_HASHES = {
+    "trainers.py": "5fb907eecc2d00a6b97d7ac45db4bd86ce4d58197b7a58363233e40040ae113f",
+    "config/loss/tidpo.yaml": (
+        "e77343adb00fa27a0d54d9c806a12510291b2c779be1639ea5e86da74149a1e8"
+    ),
+}
+
+
+def _normalized_source_sha256(path: Path) -> str:
+    """Hash source reproducibly across Git's LF/CRLF checkout conversion."""
+    content = path.read_bytes().replace(b"\r\n", b"\n")
+    return hashlib.sha256(content).hexdigest()
+
+
+def _upstream_objective_equivalence_self_test() -> dict[str, Any]:
+    """Execute the pinned repo's pure objective functions and compare this OLMo adapter."""
+    import torch
+    import torch.nn.functional as functional
+
+    upstream_root = Path(__file__).resolve().parents[2] / "third_party" / "TIDPO"
+    actual_hashes = {
+        relative: _normalized_source_sha256(upstream_root / relative)
+        for relative in TIDPO_UPSTREAM_SOURCE_HASHES
+    }
+    if actual_hashes != TIDPO_UPSTREAM_SOURCE_HASHES:
+        raise AssertionError(f"Pinned TI-DPO source hash mismatch: {actual_hashes}")
+
+    parsed = ast.parse((upstream_root / "trainers.py").read_text(encoding="utf-8"))
+    wanted = {"tdpo_loss", "_weighted_tdpo_get_batch_logps"}
+    definitions = [
+        node
+        for node in parsed.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in wanted
+    ]
+    if {node.name for node in definitions} != wanted:
+        raise AssertionError("Could not locate the pinned TI-DPO objective functions")
+    namespace: dict[str, Any] = {
+        "torch": torch,
+        "F": functional,
+        "Tuple": Tuple,
+    }
+    exec(compile(ast.Module(body=definitions, type_ignores=[]), "upstream/trainers.py", "exec"), namespace)
+
+    generator = torch.Generator().manual_seed(20250823)
+    policy_logits = torch.randn(4, 6, 13, generator=generator, requires_grad=True)
+    reference_logits = torch.randn(4, 6, 13, generator=generator)
+    labels = torch.tensor(
+        [
+            [-100, -100, 2, 3, 4, -100],
+            [-100, -100, 5, 6, 7, 8],
+            [-100, -100, 1, 9, -100, -100],
+            [-100, -100, 10, 11, 12, -100],
+        ],
+        dtype=torch.long,
+    )
+    full_weights = torch.rand(4, 6, generator=generator) + 0.25
+    upstream_margin, upstream_kl, _ = namespace["_weighted_tdpo_get_batch_logps"](
+        policy_logits,
+        reference_logits,
+        labels,
+        full_weights,
+        average_log_prob=False,
+    )
+    upstream_losses, upstream_chosen, upstream_rejected = namespace["tdpo_loss"](
+        upstream_margin[:2],
+        upstream_margin[2:],
+        upstream_kl[:2],
+        upstream_kl[2:],
+        beta=0.2,
+        alpha=0.5,
+        if_tdpo2=True,
+    )
+
+    shifted_labels = labels[:, 1:].clone()
+    completion_mask = shifted_labels.ne(-100)
+    shifted_labels.masked_fill_(~completion_mask, 0)
+    policy_vocab_logps = policy_logits[:, :-1].log_softmax(dim=-1)
+    reference_probabilities = reference_logits[:, :-1].softmax(dim=-1)
+    reference_vocab_logps = reference_probabilities.log()
+    policy_token_logps = torch.gather(
+        policy_vocab_logps, -1, shifted_labels.unsqueeze(-1)
+    ).squeeze(-1)
+    reference_token_logps = torch.gather(
+        reference_vocab_logps, -1, shifted_labels.unsqueeze(-1)
+    ).squeeze(-1)
+    adapter = tidpo_pair_loss(
+        policy_token_logps,
+        reference_token_logps,
+        completion_mask,
+        full_weights[:, 1:],
+        beta=0.2,
+        position_kl=upstream_kl,
+        alpha=0.5,
+        if_tdpo2=True,
+    )
+    adapter_loss, adapter_chosen, adapter_rejected = adapter[0], adapter[1], adapter[2]
+    if not torch.allclose(adapter_loss, upstream_losses.mean(), atol=1e-6, rtol=1e-6):
+        raise AssertionError("OLMo TI-DPO loss differs from pinned trainers.py")
+    if not torch.allclose(adapter_chosen, upstream_chosen, atol=1e-6, rtol=1e-6):
+        raise AssertionError("OLMo TI-DPO chosen reward differs from pinned trainers.py")
+    if not torch.allclose(adapter_rejected, upstream_rejected, atol=1e-6, rtol=1e-6):
+        raise AssertionError("OLMo TI-DPO rejected reward differs from pinned trainers.py")
+    upstream_gradient = torch.autograd.grad(
+        upstream_losses.mean(), policy_logits, retain_graph=True
+    )[0]
+    adapter_gradient = torch.autograd.grad(adapter_loss, policy_logits)[0]
+    if not torch.allclose(adapter_gradient, upstream_gradient, atol=2e-6, rtol=2e-6):
+        max_error = (adapter_gradient - upstream_gradient).abs().max()
+        raise AssertionError(f"OLMo TI-DPO gradient differs from pinned trainers.py: {max_error}")
+    return {
+        "commit": TIDPO_COMMIT,
+        "normalized_source_sha256": actual_hashes,
+        "loss_equal": True,
+        "rewards_equal": True,
+        "policy_gradient_equal": True,
+    }
+
+
+def _chunked_exact_kl_self_test() -> dict[str, Any]:
+    """Compare the actual T4 chunked head against a dense full-vocabulary calculation."""
+    import torch
+    import torch.nn.functional as functional
+
+    parsed = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    run_train_node = next(
+        node
+        for node in parsed.body
+        if isinstance(node, ast.FunctionDef) and node.name == "run_train"
+    )
+    wanted = {"VocabularyShardLinear", "CheckpointedChunkedLMHead"}
+    definitions = [
+        node
+        for node in run_train_node.body
+        if isinstance(node, ast.ClassDef) and node.name in wanted
+    ]
+    if {node.name for node in definitions} != wanted:
+        raise AssertionError("Could not locate the chunked TI-DPO vocabulary head")
+
+    def direct_checkpoint(function, *checkpoint_args, **checkpoint_kwargs):
+        checkpoint_kwargs.pop("use_reentrant", None)
+        if checkpoint_kwargs:
+            raise AssertionError(f"Unexpected checkpoint kwargs: {checkpoint_kwargs}")
+        return function(*checkpoint_args)
+
+    namespace: dict[str, Any] = {
+        "torch": torch,
+        "activation_checkpoint": direct_checkpoint,
+        "VOCABULARY_SHARD_SIZE": 4,
+    }
+    exec(compile(ast.Module(body=definitions, type_ignores=[]), __file__, "exec"), namespace)
+    head_class = namespace["CheckpointedChunkedLMHead"]
+
+    generator = torch.Generator().manual_seed(19653)
+    policy_source = torch.nn.Linear(5, 13, bias=False)
+    reference_source = torch.nn.Linear(5, 13, bias=False)
+    with torch.no_grad():
+        policy_source.weight.copy_(torch.randn(13, 5, generator=generator))
+        reference_source.weight.copy_(torch.randn(13, 5, generator=generator))
+    policy_head = head_class(policy_source)
+    reference_head = head_class(reference_source)
+    reference_head.requires_grad_(False)
+    policy_hidden = torch.randn(2, 4, 5, generator=generator, requires_grad=True)
+    reference_hidden = torch.randn(2, 4, 5, generator=generator)
+    labels = torch.tensor([[0, 3, 7, 12], [1, 5, 8, 11]], dtype=torch.long)
+
+    chunked_policy, chunked_reference, chunked_kl = policy_head(
+        policy_hidden,
+        labels=labels,
+        exact_reference_hidden_states=reference_hidden,
+        exact_reference_head=reference_head,
+    )
+    policy_weight = torch.cat(
+        [shard.weight for shard in policy_head.vocabulary_shards], dim=0
+    )
+    reference_weight = torch.cat(
+        [shard.weight for shard in reference_head.vocabulary_shards], dim=0
+    )
+    dense_policy_hidden = policy_hidden.detach().clone().requires_grad_(True)
+    dense_policy_logps = functional.linear(
+        dense_policy_hidden, policy_weight
+    ).log_softmax(dim=-1)
+    dense_reference_logps = functional.linear(
+        reference_hidden, reference_weight
+    ).log_softmax(dim=-1)
+    dense_policy = torch.gather(
+        dense_policy_logps, -1, labels.unsqueeze(-1)
+    ).squeeze(-1)
+    dense_reference = torch.gather(
+        dense_reference_logps, -1, labels.unsqueeze(-1)
+    ).squeeze(-1)
+    dense_kl = (
+        dense_reference_logps.exp() * (dense_reference_logps - dense_policy_logps)
+    ).sum(dim=-1)
+    comparisons = {
+        "selected_policy_logps": (chunked_policy, dense_policy),
+        "selected_reference_logps": (chunked_reference, dense_reference),
+        "full_vocabulary_kl": (chunked_kl, dense_kl),
+    }
+    for name, (chunked, dense) in comparisons.items():
+        if not torch.allclose(chunked, dense, atol=2e-6, rtol=2e-6):
+            error = (chunked - dense).abs().max()
+            raise AssertionError(f"Chunked {name} differs from dense calculation: {error}")
+    chunked_gradient = torch.autograd.grad(
+        (chunked_policy + chunked_kl).sum(), policy_hidden
+    )[0]
+    dense_gradient = torch.autograd.grad(
+        (dense_policy + dense_kl).sum(), dense_policy_hidden
+    )[0]
+    if not torch.allclose(chunked_gradient, dense_gradient, atol=3e-6, rtol=3e-6):
+        error = (chunked_gradient - dense_gradient).abs().max()
+        raise AssertionError(f"Chunked exact-KL policy gradient differs from dense: {error}")
+    return {
+        "vocabulary_size": 13,
+        "chunk_size": 4,
+        "selected_logps_equal": True,
+        "full_vocabulary_kl_equal": True,
+        "policy_hidden_gradient_equal": True,
+    }
 
 
 def _optimizer_update_32bit(
@@ -152,6 +374,7 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--model-id", required=True)
     train.add_argument("--model-revision", default=None)
     train.add_argument("--output-dir", type=Path, required=True)
+    train.add_argument("--max-length", type=int, default=1024)
     train.add_argument("--run-name", default=None)
     train.add_argument("--method", choices=METHODS, required=True)
     train.add_argument("--epochs", type=float, default=1.0)
@@ -181,6 +404,30 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--tidpo-prior-sigma-div", type=float, default=8.0)
     train.add_argument("--tidpo-triplet-gamma", type=float, default=0.001)
     train.add_argument("--tidpo-triplet-margin", type=float, default=0.001)
+    train.add_argument(
+        "--tidpo-paper-exact",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use arXiv:2505.19653v3 Eqs. 5-14: last-logit gradient attribution mixed "
+            "with a Gaussian prior, weighted DPO without TDPO position-KL, and a live "
+            "current-policy triplet anchor"
+        ),
+    )
+    train.add_argument(
+        "--tidpo-repo-exact",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use the pinned gracefulning/TIDPO implementation at commit e04a092: "
+            "full-sequence gradient/Gaussian weights, exact full-vocabulary TDPO2 "
+            "position-KL, and a live current-policy triplet anchor"
+        ),
+    )
+    train.add_argument("--tidpo-anchor-max-new-tokens", type=int, default=64)
+    train.add_argument("--tidpo-anchor-top-k", type=int, default=50)
+    train.add_argument("--tidpo-anchor-top-p", type=float, default=0.95)
+    train.add_argument("--tidpo-anchor-temperature", type=float, default=0.8)
     train.add_argument("--simpo-beta", type=float, default=2.0)
     train.add_argument("--simpo-gamma-beta-ratio", type=float, default=0.5)
     train.add_argument("--sampo-beta", type=float, default=0.1)
@@ -664,11 +911,13 @@ class PreferenceTokenCollator:
         include_reference: bool,
         include_support: bool,
         include_anchors: bool,
+        include_live_prompts: bool = False,
     ):
         self.pad_token_id = int(pad_token_id)
         self.include_reference = include_reference
         self.include_support = include_support
         self.include_anchors = include_anchors
+        self.include_live_prompts = include_live_prompts
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
         import torch
@@ -745,6 +994,36 @@ class PreferenceTokenCollator:
             "reference_support_logps": reference_support_logps,
             "row_ids": torch.as_tensor([feature["row_id"] for feature in features]),
         }
+        if self.include_live_prompts:
+            prompts = []
+            for feature in features:
+                segment_ids = feature["chosen_segment_ids"]
+                try:
+                    completion_start = next(
+                        index for index, segment_id in enumerate(segment_ids) if segment_id >= 0
+                    )
+                except StopIteration as error:
+                    raise RuntimeError(
+                        f"Chosen response has no completion for row {feature['row_id']}"
+                    ) from error
+                prompt = feature["chosen_input_ids"][:completion_start]
+                if not prompt:
+                    raise RuntimeError(f"Empty prompt for row {feature['row_id']}")
+                prompts.append(prompt)
+            prompt_width = max(map(len, prompts))
+            prompt_ids = torch.full(
+                (len(prompts), prompt_width), self.pad_token_id, dtype=torch.long
+            )
+            prompt_attention = torch.zeros((len(prompts), prompt_width), dtype=torch.long)
+            for index, prompt in enumerate(prompts):
+                prompt_ids[index, : len(prompt)] = torch.as_tensor(prompt, dtype=torch.long)
+                prompt_attention[index, : len(prompt)] = 1
+            output.update(
+                {
+                    "prompt_input_ids": prompt_ids,
+                    "prompt_attention_mask": prompt_attention,
+                }
+            )
         if self.include_anchors:
             anchor_width = max(len(feature["anchor_input_ids"]) for feature in features)
             anchor_ids = torch.full(
@@ -815,7 +1094,14 @@ def run_train(args: argparse.Namespace) -> None:
     from safetensors import safe_open
     from torch.distributed.tensor import DTensor
     from torch.utils.checkpoint import checkpoint as activation_checkpoint
-    from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments, set_seed
+    from transformers import (
+        AutoConfig,
+        AutoModelForCausalLM,
+        AutoTokenizer,
+        Trainer,
+        TrainingArguments,
+        set_seed,
+    )
     from transformers.distributed.fsdp import get_fsdp_ckpt_kwargs
     from transformers.trainer import SCHEDULER_NAME
     from trl.models.activation_offloading import get_act_offloading_ctx_manager
@@ -830,7 +1116,94 @@ def run_train(args: argparse.Namespace) -> None:
     set_seed(args.seed)
 
     train_dataset = _load_split(args.dataset_path, args.train_split)
-    needs_reference = args.method in {"TIDPO", "SamPO"}
+    if args.tidpo_paper_exact and args.tidpo_repo_exact:
+        raise ValueError("Choose only one of --tidpo-paper-exact and --tidpo-repo-exact")
+    if (args.tidpo_paper_exact or args.tidpo_repo_exact) and args.method != "TIDPO":
+        raise ValueError("TI-DPO exact-variant flags are valid only with --method TIDPO")
+    paper_exact = args.method == "TIDPO" and args.tidpo_paper_exact
+    repo_exact = args.method == "TIDPO" and args.tidpo_repo_exact
+    live_tidpo = paper_exact or repo_exact
+    upstream_evidence = None
+    if repo_exact:
+        upstream_root = Path(__file__).resolve().parents[2] / "third_party" / "TIDPO"
+        upstream_manifest_path = upstream_root / "UPSTREAM.json"
+        upstream_manifest = json.loads(upstream_manifest_path.read_text(encoding="utf-8"))
+        actual_upstream_hashes = {
+            relative: _normalized_source_sha256(upstream_root / relative)
+            for relative in TIDPO_UPSTREAM_SOURCE_HASHES
+        }
+        if (
+            upstream_manifest.get("repository") != TIDPO_REPOSITORY
+            or upstream_manifest.get("commit") != TIDPO_COMMIT
+            or actual_upstream_hashes != TIDPO_UPSTREAM_SOURCE_HASHES
+        ):
+            raise RuntimeError(
+                "Vendored TI-DPO source does not match pinned upstream commit "
+                f"{TIDPO_COMMIT}: manifest={upstream_manifest}, hashes={actual_upstream_hashes}"
+            )
+        upstream_evidence = {
+            "repository": TIDPO_REPOSITORY,
+            "commit": TIDPO_COMMIT,
+            "verified_normalized_source_sha256": actual_upstream_hashes,
+            "olmo_adapter_normalized_source_sha256": _normalized_source_sha256(
+                Path(__file__).resolve()
+            ),
+        }
+    if paper_exact:
+        published_objective_hyperparameters = {
+            "tidpo_beta": 0.1,
+            "tidpo_lambda_importance": 0.7,
+            "tidpo_prior_sigma_div": 4.0,
+            "tidpo_triplet_gamma": 0.1,
+            "tidpo_triplet_margin": 0.5,
+        }
+        mismatched = {
+            name: (float(getattr(args, name)), expected_value)
+            for name, expected_value in published_objective_hyperparameters.items()
+            if not math.isclose(
+                float(getattr(args, name)), expected_value, rel_tol=0.0, abs_tol=1e-12
+            )
+        }
+        if mismatched:
+            raise ValueError(
+                "--tidpo-paper-exact requires the arXiv:2505.19653v3 objective "
+                f"hyperparameters (actual, expected): {mismatched}"
+            )
+    if repo_exact:
+        official_repo_hyperparameters = {
+            "tidpo_beta": 0.2,
+            "tidpo_alpha": 0.5,
+            "tidpo_lambda_importance": 0.2,
+            "tidpo_prior_sigma_div": 8.0,
+            "tidpo_triplet_gamma": 0.001,
+            "tidpo_triplet_margin": 0.001,
+            "tidpo_anchor_max_new_tokens": 64.0,
+            "tidpo_anchor_top_k": 50.0,
+            "tidpo_anchor_top_p": 0.95,
+            "tidpo_anchor_temperature": 0.8,
+        }
+        mismatched = {
+            name: (float(getattr(args, name)), expected_value)
+            for name, expected_value in official_repo_hyperparameters.items()
+            if not math.isclose(
+                float(getattr(args, name)), expected_value, rel_tol=0.0, abs_tol=1e-12
+            )
+        }
+        if mismatched or not args.tidpo2:
+            raise ValueError(
+                "--tidpo-repo-exact requires gracefulning/TIDPO commit e04a092 defaults "
+                f"and TDPO2 enabled (actual, expected): {mismatched}"
+            )
+    if live_tidpo:
+        if args.tidpo_anchor_max_new_tokens < 1:
+            raise ValueError("--tidpo-anchor-max-new-tokens must be positive")
+        if args.tidpo_anchor_top_k < 1:
+            raise ValueError("--tidpo-anchor-top-k must be positive")
+        if not 0.0 < args.tidpo_anchor_top_p <= 1.0:
+            raise ValueError("--tidpo-anchor-top-p must be in (0, 1]")
+        if args.tidpo_anchor_temperature <= 0.0:
+            raise ValueError("--tidpo-anchor-temperature must be positive")
+    needs_reference = args.method in {"TIDPO", "SamPO"} and not live_tidpo
     expected = {"dataset_fingerprint": train_dataset._fingerprint}
     if needs_reference:
         if args.reference_cache is None:
@@ -881,13 +1254,23 @@ def run_train(args: argparse.Namespace) -> None:
         "ref_chosen_support_logps",
         "ref_rejected_support_logps",
     }
-    include_support = args.method == "TIDPO"
+    include_support = args.method == "TIDPO" and not live_tidpo
     if include_support and not support_columns.issubset(train_dataset.column_names):
         raise RuntimeError(
             "Reference cache has no TIDPO top-k KL support; rerun the reference command"
         )
 
-    include_anchors = args.method == "TIDPO" and args.tidpo_triplet_gamma > 0.0
+    include_anchors = (
+        args.method == "TIDPO" and not live_tidpo and args.tidpo_triplet_gamma > 0.0
+    )
+    if live_tidpo:
+        base_config = AutoConfig.from_pretrained(args.model_id, revision=args.model_revision)
+        context_limit = int(getattr(base_config, "max_position_embeddings", args.max_length))
+        if args.max_length + args.tidpo_anchor_max_new_tokens > context_limit:
+            raise ValueError(
+                "Live TI-DPO synchronized anchor decoding requires max_length + "
+                f"anchor_max_new_tokens <= model context ({context_limit})"
+            )
     anchor_columns = {
         "anchor_input_ids", "anchor_completion_mask", "ref_anchor_token_logps"
     }
@@ -941,7 +1324,30 @@ def run_train(args: argparse.Namespace) -> None:
             labels=None,
             reference_support_ids=None,
             maximum_only=False,
+            top_k_only=None,
+            exact_reference_hidden_states=None,
+            exact_reference_head=None,
         ):
+            if exact_reference_hidden_states is not None or exact_reference_head is not None:
+                if (
+                    exact_reference_hidden_states is None
+                    or exact_reference_head is None
+                    or labels is None
+                    or reference_support_ids is not None
+                    or maximum_only
+                    or top_k_only is not None
+                ):
+                    raise ValueError("Exact reference KL requires hidden states, head, and labels only")
+                return self.exact_reference_statistics(
+                    hidden_states,
+                    exact_reference_hidden_states,
+                    labels,
+                    exact_reference_head,
+                )
+            if top_k_only is not None:
+                if labels is not None or reference_support_ids is not None or maximum_only:
+                    raise ValueError("top_k_only does not accept labels, support, or maximum_only")
+                return self.top_k_logits(hidden_states, int(top_k_only))
             if maximum_only:
                 if labels is not None or reference_support_ids is not None:
                     raise ValueError("maximum_only does not accept labels or reference support")
@@ -1042,6 +1448,169 @@ def run_train(args: argparse.Namespace) -> None:
                 maximum = shard_maximum if maximum is None else torch.maximum(maximum, shard_maximum)
             return maximum
 
+        def exact_reference_statistics(
+            self,
+            policy_hidden_states,
+            reference_hidden_states,
+            labels,
+            reference_head,
+        ):
+            """Selected log-probs plus exact per-position KL(ref||policy), vocabulary-chunked."""
+            if policy_hidden_states.shape != reference_hidden_states.shape:
+                raise ValueError(
+                    "Policy/reference hidden-state mismatch: "
+                    f"{policy_hidden_states.shape} vs {reference_hidden_states.shape}"
+                )
+            if labels.shape != policy_hidden_states.shape[:-1]:
+                raise ValueError(f"Label/hidden mismatch: {labels.shape} vs {policy_hidden_states.shape}")
+            if (
+                self.out_features != reference_head.out_features
+                or self.vocabulary_offsets != reference_head.vocabulary_offsets
+                or len(self.vocabulary_shards) != len(reference_head.vocabulary_shards)
+            ):
+                raise ValueError("Policy and reference vocabulary heads are not identically sharded")
+
+            policy_selected = torch.zeros_like(labels, dtype=torch.float32)
+            reference_selected = torch.zeros_like(labels, dtype=torch.float32)
+            policy_normalizer = None
+            reference_normalizer = None
+            for start, policy_shard, reference_shard in zip(
+                self.vocabulary_offsets,
+                self.vocabulary_shards,
+                reference_head.vocabulary_shards,
+                strict=True,
+            ):
+                stop = start + policy_shard.out_features
+
+                def project_normalizers_and_selected(
+                    policy_hidden,
+                    reference_hidden,
+                    target,
+                    p_head=policy_shard,
+                    r_head=reference_shard,
+                    offset=start,
+                    limit=stop,
+                ):
+                    policy_logits = p_head(policy_hidden).float()
+                    reference_logits = r_head(reference_hidden).float()
+                    belongs = target.ge(offset) & target.lt(limit)
+                    local_target = (target - offset).clamp(0, p_head.out_features - 1)
+                    return (
+                        torch.logsumexp(policy_logits, dim=-1),
+                        torch.logsumexp(reference_logits, dim=-1),
+                        torch.gather(
+                            policy_logits, -1, local_target.unsqueeze(-1)
+                        ).squeeze(-1)
+                        * belongs,
+                        torch.gather(
+                            reference_logits, -1, local_target.unsqueeze(-1)
+                        ).squeeze(-1)
+                        * belongs,
+                    )
+
+                (
+                    shard_policy_normalizer,
+                    shard_reference_normalizer,
+                    shard_policy_selected,
+                    shard_reference_selected,
+                ) = activation_checkpoint(
+                    project_normalizers_and_selected,
+                    policy_hidden_states,
+                    reference_hidden_states,
+                    labels,
+                    use_reentrant=False,
+                )
+                policy_selected = policy_selected + shard_policy_selected
+                reference_selected = reference_selected + shard_reference_selected
+                policy_normalizer = (
+                    shard_policy_normalizer
+                    if policy_normalizer is None
+                    else torch.logaddexp(policy_normalizer, shard_policy_normalizer)
+                )
+                reference_normalizer = (
+                    shard_reference_normalizer
+                    if reference_normalizer is None
+                    else torch.logaddexp(reference_normalizer, shard_reference_normalizer)
+                )
+
+            reference_selected = reference_selected.detach()
+            reference_normalizer = reference_normalizer.detach()
+            per_position_kl = torch.zeros_like(policy_normalizer, dtype=torch.float32)
+            reference_probability_mass = torch.zeros_like(
+                reference_normalizer, dtype=torch.float32
+            )
+            for policy_shard, reference_shard in zip(
+                self.vocabulary_shards,
+                reference_head.vocabulary_shards,
+                strict=True,
+            ):
+                def project_exact_kl(
+                    policy_hidden,
+                    reference_hidden,
+                    policy_log_normalizer,
+                    reference_log_normalizer,
+                    p_head=policy_shard,
+                    r_head=reference_shard,
+                ):
+                    policy_logps = (
+                        p_head(policy_hidden).float() - policy_log_normalizer.unsqueeze(-1)
+                    )
+                    reference_logps = (
+                        r_head(reference_hidden).float() - reference_log_normalizer.unsqueeze(-1)
+                    )
+                    reference_probabilities = reference_logps.exp()
+                    return (
+                        reference_probabilities
+                        * (reference_logps - policy_logps)
+                    ).sum(dim=-1), reference_probabilities.sum(dim=-1)
+
+                shard_kl, shard_reference_mass = activation_checkpoint(
+                    project_exact_kl,
+                    policy_hidden_states,
+                    reference_hidden_states,
+                    policy_normalizer,
+                    reference_normalizer,
+                    use_reentrant=False,
+                )
+                per_position_kl = per_position_kl + shard_kl
+                reference_probability_mass = (
+                    reference_probability_mass + shard_reference_mass
+                )
+
+            if not getattr(self, "_exact_kl_audited", False):
+                if not bool(torch.isfinite(per_position_kl).all()):
+                    raise FloatingPointError("Non-finite exact full-vocabulary TI-DPO KL")
+                mass_error = reference_probability_mass.sub(1.0).abs().max()
+                if float(mass_error) > 5e-5:
+                    raise RuntimeError(
+                        "Exact reference vocabulary probability mass did not sum to one: "
+                        f"max error={float(mass_error)}"
+                    )
+                self._exact_kl_audited = True
+
+            policy_logps = policy_selected - policy_normalizer
+            reference_logps = reference_selected - reference_normalizer
+            return policy_logps, reference_logps, per_position_kl
+
+        def top_k_logits(self, hidden_states, top_k: int):
+            """Return exact global top-k logits without materializing the full vocabulary."""
+            if top_k < 1 or top_k > self.out_features:
+                raise ValueError(f"top_k must be in [1, {self.out_features}], got {top_k}")
+            candidate_logits = []
+            candidate_ids = []
+            for start, shard in zip(
+                self.vocabulary_offsets, self.vocabulary_shards, strict=True
+            ):
+                logits = shard(hidden_states).float()
+                local_k = min(top_k, shard.out_features)
+                local_logits, local_ids = torch.topk(logits, k=local_k, dim=-1)
+                candidate_logits.append(local_logits)
+                candidate_ids.append(local_ids + start)
+            logits = torch.cat(candidate_logits, dim=-1)
+            ids = torch.cat(candidate_ids, dim=-1)
+            selected_logits, selected = torch.topk(logits, k=top_k, dim=-1)
+            return selected_logits, torch.gather(ids, -1, selected)
+
     class DTensorPagedAdamW32bit(bnb.optim.PagedAdamW32bit):
         @staticmethod
         def _local(tensor):
@@ -1141,7 +1710,12 @@ def run_train(args: argparse.Namespace) -> None:
 
     class PreferenceSuiteTrainer(Trainer):
         def __init__(self, *trainer_args, **trainer_kwargs):
+            live_reference_model = trainer_kwargs.pop("live_reference_model", None)
             super().__init__(*trainer_args, **trainer_kwargs)
+            self.live_reference_model = live_reference_model
+            if self.live_reference_model is not None:
+                self.live_reference_model.to(self.accelerator.device)
+                self.live_reference_model.eval()
             self.maybe_activation_offload_context = (
                 get_act_offloading_ctx_manager(model=self.model, max_fwd_stash_size=1)
                 if args.activation_offloading
@@ -1183,42 +1757,188 @@ def run_train(args: argparse.Namespace) -> None:
             finally:
                 model.train(original_training)
 
-        def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-            policy_output = model(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                use_cache=False,
-                preference_labels=inputs["input_ids"][:, 1:],
-                reference_support_ids=(
-                    inputs["reference_support_ids"] if args.method == "TIDPO" else None
-                ),
-            )
-            if args.method == "TIDPO":
-                policy_logps, policy_support_logps = policy_output
-            else:
-                policy_logps = policy_output
-                policy_support_logps = None
-            completion_mask = inputs["completion_mask"]
-            reference_logps = inputs["reference_token_logps"]
-            triplet = torch.zeros((), device=policy_logps.device, dtype=policy_logps.dtype)
-            extra: dict[str, Any] = {}
-
-            if args.method == "SimPO":
-                loss, chosen, rejected, logits = simpo_pair_loss(
-                    policy_logps,
-                    completion_mask,
-                    beta=args.simpo_beta,
-                    gamma_beta_ratio=args.simpo_gamma_beta_ratio,
+        def _paper_gradient_importance(
+            self, model, input_ids, attention_mask, completion_mask
+        ):
+            """Implement TI-DPO v3 Eqs. 5-6 on the observed response tokens."""
+            original_training = model.training
+            model.eval()
+            try:
+                embeddings = model.get_input_embeddings()(input_ids).detach().requires_grad_(True)
+                targets = model(
+                    inputs_embeds=embeddings,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                    importance_only=True,
                 )
-            elif args.method == "SamPO":
-                loss, chosen, rejected, logits, sampled_counts = sampo_pair_loss(
+                gradients = torch.autograd.grad(
+                    targets.sum(),
+                    embeddings,
+                    retain_graph=False,
+                    create_graph=False,
+                    allow_unused=False,
+                )[0]
+                # Log-probabilities for input_ids[:, 1:] are predicted one position earlier, but
+                # attribution I_i belongs to token embedding e_i itself (paper Eq. 6).
+                importances = gradients[:, 1:].detach().abs().sum(dim=-1)
+                if importances.shape != completion_mask.shape:
+                    raise RuntimeError(
+                        f"Paper TI-DPO attribution/mask mismatch: {importances.shape} vs "
+                        f"{completion_mask.shape}"
+                    )
+                return importances
+            finally:
+                model.train(original_training)
+
+        def _sample_live_anchor(self, model, prompt_ids, prompt_attention):
+            """Sample the intermediate y from the current policy (TI-DPO Algorithm 1)."""
+            if prompt_ids.shape[0] != 1:
+                raise RuntimeError("Live-anchor TI-DPO requires per-device pair batch size 1")
+            if not bool(prompt_attention.to(torch.bool).all()):
+                raise RuntimeError("Live-anchor TI-DPO expects one unpadded local prompt")
+            prompt_length = int(prompt_ids.shape[1])
+            local_limit = min(
+                int(args.tidpo_anchor_max_new_tokens), int(args.max_length) - prompt_length
+            )
+            # Fail collectively: one rank raising while another enters an FSDP forward deadlocks.
+            synchronized_limit = torch.tensor([local_limit], dtype=torch.long, device=prompt_ids.device)
+            torch.distributed.all_reduce(
+                synchronized_limit, op=torch.distributed.ReduceOp.MIN
+            )
+            if int(synchronized_limit.item()) < 1:
+                raise RuntimeError("Prompt leaves no room for a live TI-DPO anchor response")
+            # Every rank performs the configured number of decoding forwards for FSDP collective
+            # symmetry. Tokens beyond a rank's local 1024-token allowance are dummy EOS inputs and
+            # are discarded before the triplet forward, so another rank's prompt length cannot
+            # shorten this sample's anchor.
+            decode_steps = int(args.tidpo_anchor_max_new_tokens)
+            eos_id = tokenizer.eos_token_id
+            filler_id = eos_id if eos_id is not None else tokenizer.pad_token_id
+            generated = []
+            generated_mask = []
+            finished = False
+            original_training = model.training
+            model.eval()
+            try:
+                with torch.no_grad():
+                    top_logits, top_ids, past = model(
+                        input_ids=prompt_ids,
+                        attention_mask=prompt_attention,
+                        use_cache=True,
+                        generation_top_k=args.tidpo_anchor_top_k,
+                    )
+                    running_attention = prompt_attention
+                    for step in range(decode_steps):
+                        within_local_limit = step < local_limit
+                        if finished or not within_local_limit:
+                            next_token = torch.full(
+                                (1,), filler_id, dtype=torch.long, device=prompt_ids.device
+                            )
+                            is_valid = False
+                        else:
+                            logits = top_logits / float(args.tidpo_anchor_temperature)
+                            probabilities = torch.softmax(logits, dim=-1)
+                            cumulative = probabilities.cumsum(dim=-1)
+                            remove = (cumulative - probabilities) >= float(
+                                args.tidpo_anchor_top_p
+                            )
+                            probabilities = probabilities.masked_fill(remove, 0.0)
+                            probabilities = probabilities / probabilities.sum(
+                                dim=-1, keepdim=True
+                            )
+                            sampled = torch.multinomial(probabilities, num_samples=1)
+                            next_token = torch.gather(top_ids, -1, sampled).squeeze(-1)
+                            is_valid = True
+                        generated.append(next_token)
+                        generated_mask.append(is_valid)
+                        if eos_id is not None and is_valid and int(next_token.item()) == eos_id:
+                            finished = True
+                        if step + 1 == decode_steps:
+                            break
+                        running_attention = torch.cat(
+                            [
+                                running_attention,
+                                torch.ones(
+                                    (1, 1),
+                                    dtype=running_attention.dtype,
+                                    device=running_attention.device,
+                                ),
+                            ],
+                            dim=1,
+                        )
+                        top_logits, top_ids, past = model(
+                            input_ids=next_token[:, None],
+                            attention_mask=running_attention,
+                            past_key_values=past,
+                            use_cache=True,
+                            generation_top_k=args.tidpo_anchor_top_k,
+                        )
+            finally:
+                model.train(original_training)
+            generated = generated[:local_limit]
+            generated_mask = generated_mask[:local_limit]
+            generated_ids = torch.stack(generated, dim=1)
+            anchor_ids = torch.cat([prompt_ids, generated_ids], dim=1)
+            anchor_attention = torch.ones_like(anchor_ids)
+            anchor_mask = torch.zeros(
+                (1, anchor_ids.shape[1] - 1), dtype=torch.bool, device=anchor_ids.device
+            )
+            start = prompt_length - 1
+            anchor_mask[0, start : start + len(generated_mask)] = torch.as_tensor(
+                generated_mask, dtype=torch.bool, device=anchor_ids.device
+            )
+            if not bool(anchor_mask.any()):
+                raise RuntimeError("Current-policy anchor generation produced no response token")
+            return anchor_ids, anchor_attention, anchor_mask
+
+        @staticmethod
+        def _combine_pair_and_anchor(inputs, anchor_ids, anchor_attention, anchor_mask):
+            pair_ids = inputs["input_ids"]
+            pair_attention = inputs["attention_mask"]
+            pair_mask = inputs["completion_mask"]
+            width = max(pair_ids.shape[1], anchor_ids.shape[1])
+            rows = pair_ids.shape[0] + anchor_ids.shape[0]
+            combined_ids = torch.full(
+                (rows, width),
+                tokenizer.pad_token_id,
+                dtype=pair_ids.dtype,
+                device=pair_ids.device,
+            )
+            combined_attention = torch.zeros(
+                (rows, width), dtype=pair_attention.dtype, device=pair_ids.device
+            )
+            combined_mask = torch.zeros(
+                (rows, width - 1), dtype=torch.bool, device=pair_ids.device
+            )
+            combined_ids[: pair_ids.shape[0], : pair_ids.shape[1]] = pair_ids
+            combined_attention[: pair_ids.shape[0], : pair_ids.shape[1]] = pair_attention
+            combined_mask[: pair_ids.shape[0], : pair_mask.shape[1]] = pair_mask
+            combined_ids[pair_ids.shape[0] :, : anchor_ids.shape[1]] = anchor_ids
+            combined_attention[pair_ids.shape[0] :, : anchor_ids.shape[1]] = anchor_attention
+            combined_mask[pair_ids.shape[0] :, : anchor_mask.shape[1]] = anchor_mask
+            return combined_ids, combined_attention, combined_mask
+
+        def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+            extra: dict[str, Any] = {}
+            if repo_exact:
+                if self.live_reference_model is None:
+                    raise RuntimeError(
+                        "Official-repo-exact TI-DPO requires a live frozen reference model"
+                    )
+                (
                     policy_logps,
                     reference_logps,
-                    completion_mask,
-                    beta=args.sampo_beta,
+                    per_position_kl,
+                ) = model(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    use_cache=False,
+                    preference_labels=inputs["input_ids"][:, 1:],
+                    exact_reference_model=self.live_reference_model,
                 )
-                extra["sampled_tokens"] = sampled_counts.to(torch.float32).mean().detach()
-            elif args.method == "TIDPO":
+                completion_mask = inputs["completion_mask"]
+                position_kl = (per_position_kl * completion_mask).sum(dim=-1)
+
                 importances = self._gradient_importance(
                     model, inputs["input_ids"], inputs["attention_mask"]
                 )
@@ -1228,35 +1948,40 @@ def run_train(args: argparse.Namespace) -> None:
                     lambda_importance=args.tidpo_lambda_importance,
                     prior_sigma_div=args.tidpo_prior_sigma_div,
                 )
-                # Match the imported implementation: normalize over all non-padding sequence
-                # tokens, shift once, and apply the resulting weights only at response positions.
+                # The pinned repository normalizes over the full non-padding sequence, shifts
+                # once for next-token predictions, then masks the prompt in the TDPO2 loss.
                 importance_weights = full_importance_weights[:, 1:]
-                position_kl = topk_bucket_position_kl(
-                    policy_support_logps,
-                    inputs["reference_support_logps"],
-                    completion_mask,
+
+                anchor_ids, anchor_attention, anchor_mask = self._sample_live_anchor(
+                    model, inputs["prompt_input_ids"], inputs["prompt_attention_mask"]
                 )
-                if include_anchors:
-                    anchor_policy_logps = model(
-                        input_ids=inputs["anchor_input_ids"],
-                        attention_mask=inputs["anchor_attention_mask"],
+                anchor_policy_logps = model(
+                    input_ids=anchor_ids,
+                    attention_mask=anchor_attention,
+                    use_cache=False,
+                    preference_labels=anchor_ids[:, 1:],
+                )
+                with torch.no_grad():
+                    anchor_reference_logps = self.live_reference_model(
+                        input_ids=anchor_ids,
+                        attention_mask=anchor_attention,
                         use_cache=False,
-                        preference_labels=inputs["anchor_input_ids"][:, 1:],
+                        preference_labels=anchor_ids[:, 1:],
                     )
-                    pair_count = policy_logps.shape[0] // 2
-                    ratios = policy_logps - reference_logps.to(policy_logps.dtype)
-                    anchor_ratios = anchor_policy_logps - inputs[
-                        "reference_anchor_token_logps"
-                    ].to(anchor_policy_logps.dtype)
-                    triplet = packed_triplet_loss(
-                        anchor_ratios,
-                        inputs["anchor_completion_mask"],
-                        ratios[:pair_count],
-                        completion_mask[:pair_count],
-                        ratios[pair_count:],
-                        completion_mask[pair_count:],
-                        margin=args.tidpo_triplet_margin,
-                    )
+                ratios = policy_logps - reference_logps.to(policy_logps.dtype)
+                anchor_ratios = anchor_policy_logps - anchor_reference_logps.to(
+                    anchor_policy_logps.dtype
+                )
+                pair_count = policy_logps.shape[0] // 2
+                triplet = packed_triplet_loss(
+                    anchor_ratios,
+                    anchor_mask,
+                    ratios[:pair_count],
+                    completion_mask[:pair_count],
+                    ratios[pair_count:],
+                    completion_mask[pair_count:],
+                    margin=args.tidpo_triplet_margin,
+                )
                 (
                     loss,
                     chosen,
@@ -1274,19 +1999,197 @@ def run_train(args: argparse.Namespace) -> None:
                     beta=args.tidpo_beta,
                     position_kl=position_kl,
                     alpha=args.tidpo_alpha,
-                    if_tdpo2=args.tidpo2,
+                    if_tdpo2=True,
                     triplet_loss=triplet,
                     triplet_gamma=args.tidpo_triplet_gamma,
                 )
                 extra["base_loss"] = base_loss.detach()
                 extra["chosen_position_kl"] = chosen_kl.mean().detach()
                 extra["rejected_position_kl"] = rejected_kl.mean().detach()
-                extra["importance_weight_max"] = importance_weights.max().detach()
+                extra["exact_position_kl_mean"] = position_kl.mean().detach()
+                extra["importance_weight_max"] = importance_weights[
+                    completion_mask
+                ].max().detach()
                 extra["importance_weight_min_valid"] = importance_weights[
                     completion_mask
                 ].min().detach()
+                extra["anchor_tokens"] = anchor_mask.sum().to(torch.float32)
+            elif paper_exact:
+                if self.live_reference_model is None:
+                    raise RuntimeError("Paper-exact TI-DPO requires a live frozen reference model")
+                anchor_ids, anchor_attention, anchor_mask = self._sample_live_anchor(
+                    model, inputs["prompt_input_ids"], inputs["prompt_attention_mask"]
+                )
+                importances = self._paper_gradient_importance(
+                    model,
+                    inputs["input_ids"],
+                    inputs["attention_mask"],
+                    inputs["completion_mask"],
+                )
+                pair_weights = paper_tidpo_importance_weights(
+                    importances,
+                    inputs["completion_mask"],
+                    lambda_importance=args.tidpo_lambda_importance,
+                    prior_sigma_div=args.tidpo_prior_sigma_div,
+                )
+                combined_ids, combined_attention, combined_mask = (
+                    self._combine_pair_and_anchor(
+                        inputs, anchor_ids, anchor_attention, anchor_mask
+                    )
+                )
+                policy_all_logps = model(
+                    input_ids=combined_ids,
+                    attention_mask=combined_attention,
+                    use_cache=False,
+                    preference_labels=combined_ids[:, 1:],
+                )
+                with torch.no_grad():
+                    reference_all_logps = self.live_reference_model(
+                        input_ids=combined_ids,
+                        attention_mask=combined_attention,
+                        use_cache=False,
+                        preference_labels=combined_ids[:, 1:],
+                    )
+                pair_rows = inputs["input_ids"].shape[0]
+                policy_logps = policy_all_logps[:pair_rows]
+                reference_logps = reference_all_logps[:pair_rows]
+                completion_mask = combined_mask[:pair_rows]
+                importance_weights = torch.zeros_like(policy_logps, dtype=torch.float32)
+                importance_weights[:, : pair_weights.shape[1]] = pair_weights
+                ratios = policy_logps - reference_logps.to(policy_logps.dtype)
+                anchor_ratios = policy_all_logps[pair_rows:] - reference_all_logps[
+                    pair_rows:
+                ].to(policy_all_logps.dtype)
+                pair_count = pair_rows // 2
+                triplet = packed_triplet_loss(
+                    anchor_ratios,
+                    combined_mask[pair_rows:],
+                    ratios[:pair_count],
+                    completion_mask[:pair_count],
+                    ratios[pair_count:],
+                    completion_mask[pair_count:],
+                    margin=args.tidpo_triplet_margin,
+                )
+                loss, chosen, rejected, logits, base_loss, triplet = paper_tidpo_pair_loss(
+                    policy_logps,
+                    reference_logps,
+                    completion_mask,
+                    importance_weights,
+                    beta=args.tidpo_beta,
+                    triplet_loss=triplet,
+                    triplet_gamma=args.tidpo_triplet_gamma,
+                )
+                extra["base_loss"] = base_loss.detach()
+                extra["importance_weight_max"] = importance_weights[
+                    completion_mask
+                ].max().detach()
+                extra["importance_weight_min_valid"] = importance_weights[
+                    completion_mask
+                ].min().detach()
+                extra["anchor_tokens"] = combined_mask[pair_rows:].sum().to(torch.float32)
             else:
-                raise AssertionError(args.method)
+                policy_output = model(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    use_cache=False,
+                    preference_labels=inputs["input_ids"][:, 1:],
+                    reference_support_ids=(
+                        inputs["reference_support_ids"] if args.method == "TIDPO" else None
+                    ),
+                )
+                if args.method == "TIDPO":
+                    policy_logps, policy_support_logps = policy_output
+                else:
+                    policy_logps = policy_output
+                    policy_support_logps = None
+                completion_mask = inputs["completion_mask"]
+                reference_logps = inputs["reference_token_logps"]
+                triplet = torch.zeros((), device=policy_logps.device, dtype=policy_logps.dtype)
+
+                if args.method == "SimPO":
+                    loss, chosen, rejected, logits = simpo_pair_loss(
+                        policy_logps,
+                        completion_mask,
+                        beta=args.simpo_beta,
+                        gamma_beta_ratio=args.simpo_gamma_beta_ratio,
+                    )
+                elif args.method == "SamPO":
+                    loss, chosen, rejected, logits, sampled_counts = sampo_pair_loss(
+                        policy_logps,
+                        reference_logps,
+                        completion_mask,
+                        beta=args.sampo_beta,
+                    )
+                    extra["sampled_tokens"] = sampled_counts.to(torch.float32).mean().detach()
+                elif args.method == "TIDPO":
+                    importances = self._gradient_importance(
+                        model, inputs["input_ids"], inputs["attention_mask"]
+                    )
+                    full_importance_weights = tidpo_importance_weights(
+                        importances,
+                        inputs["attention_mask"].to(torch.bool),
+                        lambda_importance=args.tidpo_lambda_importance,
+                        prior_sigma_div=args.tidpo_prior_sigma_div,
+                    )
+                    # Match the imported implementation: normalize over all non-padding sequence
+                    # tokens, shift once, and apply the resulting weights only at response positions.
+                    importance_weights = full_importance_weights[:, 1:]
+                    position_kl = topk_bucket_position_kl(
+                        policy_support_logps,
+                        inputs["reference_support_logps"],
+                        completion_mask,
+                    )
+                    if include_anchors:
+                        anchor_policy_logps = model(
+                            input_ids=inputs["anchor_input_ids"],
+                            attention_mask=inputs["anchor_attention_mask"],
+                            use_cache=False,
+                            preference_labels=inputs["anchor_input_ids"][:, 1:],
+                        )
+                        pair_count = policy_logps.shape[0] // 2
+                        ratios = policy_logps - reference_logps.to(policy_logps.dtype)
+                        anchor_ratios = anchor_policy_logps - inputs[
+                            "reference_anchor_token_logps"
+                        ].to(anchor_policy_logps.dtype)
+                        triplet = packed_triplet_loss(
+                            anchor_ratios,
+                            inputs["anchor_completion_mask"],
+                            ratios[:pair_count],
+                            completion_mask[:pair_count],
+                            ratios[pair_count:],
+                            completion_mask[pair_count:],
+                            margin=args.tidpo_triplet_margin,
+                        )
+                    (
+                        loss,
+                        chosen,
+                        rejected,
+                        logits,
+                        base_loss,
+                        triplet,
+                        chosen_kl,
+                        rejected_kl,
+                    ) = tidpo_pair_loss(
+                        policy_logps,
+                        reference_logps,
+                        completion_mask,
+                        importance_weights,
+                        beta=args.tidpo_beta,
+                        position_kl=position_kl,
+                        alpha=args.tidpo_alpha,
+                        if_tdpo2=args.tidpo2,
+                        triplet_loss=triplet,
+                        triplet_gamma=args.tidpo_triplet_gamma,
+                    )
+                    extra["base_loss"] = base_loss.detach()
+                    extra["chosen_position_kl"] = chosen_kl.mean().detach()
+                    extra["rejected_position_kl"] = rejected_kl.mean().detach()
+                    extra["importance_weight_max"] = importance_weights.max().detach()
+                    extra["importance_weight_min_valid"] = importance_weights[
+                        completion_mask
+                    ].min().detach()
+                else:
+                    raise AssertionError(args.method)
 
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"Non-finite {args.method} loss: {loss.detach()}")
@@ -1413,39 +2316,96 @@ def run_train(args: argparse.Namespace) -> None:
     if parameter_info["total_parameters"] != parameter_info["trainable_parameters"]:
         raise RuntimeError(f"Full-parameter training check failed: {parameter_info}")
 
-    standard_model_forward = model.forward
+    def install_memory_efficient_forward(target_model):
+        standard_model_forward = target_model.forward
 
-    @functools.wraps(standard_model_forward)
-    def memory_efficient_model_forward(
-        self,
-        *model_args,
-        preference_labels=None,
-        reference_support_ids=None,
-        importance_only=False,
-        **model_kwargs,
-    ):
-        if preference_labels is None and not importance_only:
-            return standard_model_forward(*model_args, **model_kwargs)
-        model_kwargs.pop("labels", None)
-        model_kwargs["return_dict"] = True
-        outputs = self.model(*model_args, **model_kwargs)
-        if importance_only:
-            attention_mask = model_kwargs.get("attention_mask")
-            if attention_mask is None:
-                raise ValueError("importance_only requires an attention mask")
-            last_positions = attention_mask.to(torch.long).sum(dim=-1).sub(1).clamp_min(0)
-            batch_indices = torch.arange(
-                outputs.last_hidden_state.shape[0], device=outputs.last_hidden_state.device
-            )
-            last_hidden = outputs.last_hidden_state[batch_indices, last_positions]
-            # Invoke the module through __call__/forward so FSDP2 runs the parent head's
-            # pre/post-forward hooks. Calling maximum_logit() directly bypassed those hooks and
-            # left the nested vocabulary shards resharded before the main loss backward.
-            return self.lm_head(last_hidden, maximum_only=True)
-        hidden_states = outputs.last_hidden_state[..., :-1, :]
-        return self.lm_head(hidden_states, preference_labels, reference_support_ids)
+        @functools.wraps(standard_model_forward)
+        def memory_efficient_model_forward(
+            self,
+            *model_args,
+            preference_labels=None,
+            reference_support_ids=None,
+            exact_reference_model=None,
+            importance_only=False,
+            generation_top_k=None,
+            **model_kwargs,
+        ):
+            if (
+                preference_labels is None
+                and exact_reference_model is None
+                and not importance_only
+                and generation_top_k is None
+            ):
+                return standard_model_forward(*model_args, **model_kwargs)
+            model_kwargs.pop("labels", None)
+            model_kwargs["return_dict"] = True
+            outputs = self.model(*model_args, **model_kwargs)
+            if exact_reference_model is not None:
+                if (
+                    preference_labels is None
+                    or reference_support_ids is not None
+                    or importance_only
+                    or generation_top_k is not None
+                ):
+                    raise ValueError(
+                        "Exact reference statistics require labels and cannot be combined "
+                        "with support, importance, or generation modes"
+                    )
+                with torch.no_grad():
+                    reference_outputs = exact_reference_model.model(
+                        *model_args, **model_kwargs
+                    )
+                return self.lm_head(
+                    outputs.last_hidden_state[..., :-1, :],
+                    labels=preference_labels,
+                    exact_reference_hidden_states=(
+                        reference_outputs.last_hidden_state[..., :-1, :]
+                    ),
+                    exact_reference_head=exact_reference_model.lm_head,
+                )
+            if generation_top_k is not None:
+                hidden = outputs.last_hidden_state[:, -1, :]
+                top_logits, top_ids = self.lm_head(
+                    hidden, top_k_only=int(generation_top_k)
+                )
+                return top_logits, top_ids, outputs.past_key_values
+            if importance_only:
+                attention_mask = model_kwargs.get("attention_mask")
+                if attention_mask is None:
+                    raise ValueError("importance_only requires an attention mask")
+                last_positions = attention_mask.to(torch.long).sum(dim=-1).sub(1).clamp_min(0)
+                batch_indices = torch.arange(
+                    outputs.last_hidden_state.shape[0], device=outputs.last_hidden_state.device
+                )
+                last_hidden = outputs.last_hidden_state[batch_indices, last_positions]
+                # Invoke the module through __call__/forward so FSDP2 runs the parent head's
+                # pre/post-forward hooks. Calling maximum_logit() directly bypassed those hooks and
+                # left the nested vocabulary shards resharded before the main loss backward.
+                return self.lm_head(last_hidden, maximum_only=True)
+            hidden_states = outputs.last_hidden_state[..., :-1, :]
+            return self.lm_head(hidden_states, preference_labels, reference_support_ids)
 
-    model.forward = MethodType(memory_efficient_model_forward, model)
+        target_model.forward = MethodType(memory_efficient_model_forward, target_model)
+
+    install_memory_efficient_forward(model)
+
+    live_reference_model = None
+    if live_tidpo:
+        live_reference_model = AutoModelForCausalLM.from_pretrained(
+            args.model_id,
+            revision=args.model_revision,
+            dtype=torch.float16,
+            attn_implementation="sdpa",
+            low_cpu_mem_usage=True,
+        )
+        live_reference_model.requires_grad_(False)
+        live_reference_model.config.use_cache = False
+        live_reference_model.lm_head = CheckpointedChunkedLMHead(
+            live_reference_model.lm_head
+        )
+        live_reference_model.requires_grad_(False)
+        install_memory_efficient_forward(live_reference_model)
+        live_reference_model.eval()
 
     save_enabled = args.save_steps > 0
     run_name = args.run_name or f"olmo2-1b-bees-{args.method.lower()}"
@@ -1509,6 +2469,7 @@ def run_train(args: argparse.Namespace) -> None:
     )
     trainer = PreferenceSuiteTrainer(
         model=model,
+        live_reference_model=live_reference_model,
         args=training_args,
         train_dataset=train_dataset,
         data_collator=PreferenceTokenCollator(
@@ -1516,6 +2477,7 @@ def run_train(args: argparse.Namespace) -> None:
             include_reference=needs_reference,
             include_support=include_support,
             include_anchors=include_anchors,
+            include_live_prompts=live_tidpo,
         ),
         processing_class=tokenizer,
     )
@@ -1578,8 +2540,37 @@ def run_train(args: argparse.Namespace) -> None:
             args.output_dir / "training_manifest.json",
             {
                 "method": args.method,
-                "method_description": METHOD_DESCRIPTIONS[args.method],
-                "objective_formula": METHOD_FORMULAS[args.method],
+                "tidpo_variant": (
+                    "official_repo_exact"
+                    if repo_exact
+                    else (
+                        "paper_exact"
+                        if paper_exact
+                        else ("repository_approximation" if args.method == "TIDPO" else None)
+                    )
+                ),
+                "method_description": (
+                    "Exact objective port of gracefulning/TIDPO commit e04a092 to OLMo: "
+                    "full-sequence gradient/Gaussian weighting, full-vocabulary TDPO2 KL, "
+                    "and a live current-policy triplet anchor"
+                    if repo_exact
+                    else (
+                        "TI-DPO paper-equation variant from arXiv:2505.19653v3 Eqs. 5-14"
+                        if paper_exact
+                        else METHOD_DESCRIPTIONS[args.method]
+                    )
+                ),
+                "objective_formula": (
+                    METHOD_FORMULAS["TIDPO"]
+                    if repo_exact
+                    else (
+                        "-logsigmoid(beta * (sum_t w+_t log(pi/ref) - sum_t w-_t "
+                        "log(pi/ref))) + triplet_gamma * L_triplet; w=lambda*normalize(L1 "
+                        "last-logit gradient attribution)+(1-lambda)*Gaussian"
+                        if paper_exact
+                        else METHOD_FORMULAS[args.method]
+                    )
+                ),
                 "training_signature": {
                     "method": args.method,
                     "epochs": args.epochs,
@@ -1589,6 +2580,9 @@ def run_train(args: argparse.Namespace) -> None:
                     "seed": args.seed,
                     "transformer_layer_class": args.transformer_layer_class,
                     "activation_offloading": args.activation_offloading,
+                    "max_length": args.max_length,
+                    "tidpo_paper_exact": args.tidpo_paper_exact,
+                    "tidpo_repo_exact": args.tidpo_repo_exact,
                     "tidpo_beta": args.tidpo_beta,
                     "tidpo_alpha": args.tidpo_alpha,
                     "tidpo2": args.tidpo2,
@@ -1597,6 +2591,10 @@ def run_train(args: argparse.Namespace) -> None:
                     "tidpo_prior_sigma_div": args.tidpo_prior_sigma_div,
                     "tidpo_triplet_gamma": args.tidpo_triplet_gamma,
                     "tidpo_triplet_margin": args.tidpo_triplet_margin,
+                    "tidpo_anchor_max_new_tokens": args.tidpo_anchor_max_new_tokens,
+                    "tidpo_anchor_top_k": args.tidpo_anchor_top_k,
+                    "tidpo_anchor_top_p": args.tidpo_anchor_top_p,
+                    "tidpo_anchor_temperature": args.tidpo_anchor_temperature,
                     "simpo_beta": args.simpo_beta,
                     "simpo_gamma_beta_ratio": args.simpo_gamma_beta_ratio,
                     "sampo_beta": args.sampo_beta,
@@ -1609,20 +2607,114 @@ def run_train(args: argparse.Namespace) -> None:
                     str(args.reference_cache.resolve()) if args.reference_cache is not None else None
                 ),
                 "final_model": str(final_dir),
+                "tidpo_paper": "arXiv:2505.19653v3" if paper_exact else None,
                 "tidpo_upstream_repository": TIDPO_REPOSITORY,
                 "tidpo_upstream_commit": TIDPO_COMMIT,
+                "tidpo_source_evidence": upstream_evidence,
+                "tidpo_fidelity": (
+                    "official_repository_objective_exact"
+                    if repo_exact
+                    else (
+                        "paper_equations_exact"
+                        if paper_exact
+                        else ("repository_inspired_approximation" if args.method == "TIDPO" else None)
+                    )
+                ),
+                "tidpo_controlled_port_disclosure": (
+                    "The method-specific objective and pinned defaults match the official "
+                    "repository. The base model, dataset, optimizer, schedule, precision, and "
+                    "distributed runtime are the shared OLMo comparison recipe, not the "
+                    "authors' Llama/Mistral experiment recipe."
+                    if repo_exact
+                    else None
+                ),
                 "tidpo_fixed_anchor_cache": include_anchors,
+                "tidpo_live_policy_anchor": live_tidpo,
                 "tidpo_position_kl": {
-                    "kind": "reference_topk_plus_remainder_bucket_lower_bound",
-                    "top_k": args.tidpo_kl_top_k,
-                    "exact_full_vocabulary": False,
-                    "support_projection_activation_checkpointing": False,
-                    "support_projection_activation_offloading": args.activation_offloading,
-                    "reason": "avoid a resident full reference model during full-parameter training",
+                    "kind": (
+                        "exact_full_vocabulary_reference_to_policy"
+                        if repo_exact
+                        else (
+                            "not_in_paper_objective"
+                            if paper_exact
+                            else "reference_topk_plus_remainder_bucket_lower_bound"
+                        )
+                    ),
+                    "top_k": None if live_tidpo else args.tidpo_kl_top_k,
+                    "exact_full_vocabulary": True if repo_exact else (None if paper_exact else False),
+                    "support_projection_activation_checkpointing": (
+                        None if live_tidpo else False
+                    ),
+                    "support_projection_activation_offloading": (
+                        None if live_tidpo else args.activation_offloading
+                    ),
+                    "reason": (
+                        "Pinned repository TDPO2 computes KL(ref||policy) over every vocabulary token"
+                        if repo_exact
+                        else (
+                            "TI-DPO paper Eqs. 11-14 contain no TDPO position-KL term"
+                            if paper_exact
+                            else "avoid a resident full reference model during full-parameter training"
+                        )
+                    ),
                 },
                 "tidpo_importance_normalization": (
-                    "all_nonpadding_sequence_tokens_then_apply_at_response_positions"
+                    "all_nonpadding_sequence_tokens_then_shift_and_apply_at_response_positions"
+                    if repo_exact
+                    else (
+                        "per_response_sum_normalized_gradient_plus_unnormalized_gaussian_eqs_6_8"
+                        if paper_exact
+                        else "all_nonpadding_sequence_tokens_then_apply_at_response_positions"
+                    )
                 ),
+                "tidpo_gaussian_prior": True,
+                "tidpo_gaussian_prior_sum_normalized": False if paper_exact else True,
+                "tidpo_weight_length_rescale": True if repo_exact else (False if paper_exact else None),
+                "tidpo_official_defaults_enforced": repo_exact,
+                "tidpo_official_objective": (
+                    {
+                        "base": "weighted_tdpo2",
+                        "beta": 0.2,
+                        "alpha": 0.5,
+                        "if_tdpo2": True,
+                        "position_kl_direction": "KL(reference||policy)",
+                        "position_kl_vocabulary": "full",
+                        "triplet_gamma": 0.001,
+                        "triplet_margin": 0.001,
+                    }
+                    if repo_exact
+                    else None
+                ),
+                "tidpo_official_importance": (
+                    {
+                        "attribution_target": "maximum_logit_at_last_valid_sequence_position",
+                        "gradient_norm": "L1_over_embedding_dimension",
+                        "normalization_scope": "all_nonpadding_prompt_and_response_tokens",
+                        "lambda_importance": 0.2,
+                        "gaussian_center": "(valid_token_count-1)/2",
+                        "gaussian_sigma": "max(1, valid_token_count/8)",
+                        "gaussian_sum_normalized": True,
+                        "mixture_sum_normalized": True,
+                        "mixture_rescaled_by_valid_token_count": True,
+                        "application": "shift_once_then_mask_to_labeled_response_positions",
+                    }
+                    if repo_exact
+                    else None
+                ),
+                "tidpo_official_anchor": (
+                    {
+                        "source": "current_policy_same_prompt_live",
+                        "max_new_tokens": 64,
+                        "do_sample": True,
+                        "top_k": 50,
+                        "top_p": 0.95,
+                        "temperature": 0.8,
+                        "triplet_alignment": "response_token_ordinal",
+                    }
+                    if repo_exact
+                    else None
+                ),
+                "live_frozen_reference_model": live_tidpo,
                 "optimizer": "bitsandbytes.optim.PagedAdamW32bit",
                 "optimizer_class": optimizer_class,
                 "optimizer_is_paged": optimizer_is_paged,
@@ -1669,6 +2761,8 @@ def main() -> None:
         configure_workspace(args.workspace)
         results = run_loss_self_tests()
         results["optimizer_update_32bit_contract"] = _optimizer_contract_self_test()
+        results["tidpo_upstream_equivalence"] = _upstream_objective_equivalence_self_test()
+        results["tidpo_chunked_exact_kl"] = _chunked_exact_kl_self_test()
         print(json.dumps(results, indent=2))
     else:
         raise AssertionError(args.command)

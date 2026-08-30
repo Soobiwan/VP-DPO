@@ -10,6 +10,7 @@ This repository contains preference-data selection, DPO-family training, ranking
 | `BeeS/notebooks/` | Start-to-finish local OLMo 2 workflow: prepare/select data, then train and evaluate DPO. |
 | `notebooks/local/` | Local workstation experiments, including Ollama ranking and the multi-method dual-GPU run. |
 | `notebooks/kaggle/` | Self-contained Kaggle notebooks for MiniCPM and OLMo methods on P100 or dual T4 GPUs. |
+| `notebooks/kaggle/per_model_dual_t4/` | One-model-per-notebook, dual-T4 evaluation suite for MMLU, GSM8K, GPQA, HumanEval, TruthfulQA, and IFEval. |
 | `notebooks/evaluation/` | AlpacaEval judge notebook. |
 | `scripts/evaluation/` | Command-line AlpacaEval runner and Azure OpenAI compatibility adapter. |
 | `scripts/ranking/` | Resumable Ollama segmenter/ranker used by the local ranking notebook. |
@@ -79,6 +80,7 @@ Choose the `VP-DPO (OLMo)` kernel, then open the relevant notebook:
 - `BeeS/notebooks/`: primary local preparation and DPO workflow.
 - `notebooks/local/`: local Ollama ranking and experimental multi-method training.
 - `notebooks/kaggle/`: upload the selected notebook to Kaggle and use the accelerator named in its filename. These notebooks manage Kaggle input/output paths themselves.
+- `notebooks/kaggle/per_model_dual_t4/`: choose one model notebook, attach its configured Kaggle input, select GPU T4 x2, and run all cells to produce raw artifacts, scores, and a ZIP before moving to the next model.
 - `notebooks/evaluation/`: interactive AlpacaEval judging.
 
 The notebooks expose their run switches and paths near the top. Read those configuration cells before running all cells because the training jobs are long and produce large checkpoints.
@@ -119,6 +121,7 @@ python BeeS/tools/build_notebooks.py
 python BeeS/tools/build_structured_notebook.py
 python BeeS/tools/build_kaggle_preference_notebooks.py
 python BeeS/tools/build_kaggle_method_b_norm_notebooks.py
+python scripts/build_dual_t4_eval_notebooks.py
 ```
 
 The builders write into `BeeS/notebooks/`, `notebooks/local/`, or `notebooks/kaggle/` as appropriate.

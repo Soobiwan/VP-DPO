@@ -283,27 +283,47 @@ def build_notebook(method_key: str, config: dict) -> dict:
                 return None
 
 
+            clone_target = SCRATCH_ROOT / "source"
+
+
+            def clone_source_repository() -> None:
+                subprocess.check_call([
+                    "git", "clone", "--depth", "1", "--branch", REPO_REF,
+                    REPO_URL, str(clone_target),
+                ])
+
+
             SOURCE_REPO = locate_repo()
             if SOURCE_REPO is None:
-                clone_target = SCRATCH_ROOT / "source"
                 if clone_target.exists() and not is_repo(clone_target):
                     shutil.rmtree(clone_target)
                 if not clone_target.exists():
-                    subprocess.check_call([
-                        "git", "clone", "--depth", "1", "--branch", REPO_REF,
-                        REPO_URL, str(clone_target),
-                    ])
+                    clone_source_repository()
                 SOURCE_REPO = clone_target
 
             PROJECT_ROOT = SOURCE_REPO / "BeeS"
             requirements = PROJECT_ROOT / {requirements_file!r}
             if TIDPO_VARIANT == "official_repo_exact":
                 expected_adapter_hash = (
-                    "bcf8c44c9ae22ad898299edf70c42ac11f3595ecedd8e521c918af86e454eeb6"
+                    "28b6f8442a34bd6dce361da3d4b48ccd4785cde9b897fc03fcfd62ea1ceaf1ed"
                 )
                 actual_adapter_hash = normalized_source_sha256(
                     PROJECT_ROOT / "olmo2_bees" / "train_preference_suite.py"
                 )
+                if (
+                    actual_adapter_hash != expected_adapter_hash
+                    and SOURCE_REPO.resolve() == clone_target.resolve()
+                ):
+                    # A failed Kaggle run can leave an older shallow clone under /kaggle/temp.
+                    # Refresh that disposable clone once before rejecting the source snapshot.
+                    shutil.rmtree(clone_target)
+                    clone_source_repository()
+                    SOURCE_REPO = clone_target
+                    PROJECT_ROOT = SOURCE_REPO / "BeeS"
+                    requirements = PROJECT_ROOT / {requirements_file!r}
+                    actual_adapter_hash = normalized_source_sha256(
+                        PROJECT_ROOT / "olmo2_bees" / "train_preference_suite.py"
+                    )
                 if actual_adapter_hash != expected_adapter_hash:
                     raise RuntimeError(
                         "This checkout does not contain the audited official-repo-exact OLMo "
@@ -333,7 +353,10 @@ def build_notebook(method_key: str, config: dict) -> dict:
             CACHE_ENV = configure_workspace(SCRATCH_ROOT)
 
             source_name = "ultrafeedback_bees_olmo2_1b_segmented_final.jsonl"
-            source_candidates = [SOURCE_REPO / source_name]
+            source_candidates = [
+                SOURCE_REPO / "data" / "processed" / source_name,
+                SOURCE_REPO / source_name,
+            ]
             if ON_KAGGLE:
                 source_candidates.extend(Path("/kaggle/input").rglob(source_name))
             SOURCE_JSONL = max(
@@ -343,7 +366,10 @@ def build_notebook(method_key: str, config: dict) -> dict:
             )
             if SOURCE_JSONL is None or SOURCE_JSONL.stat().st_size < 1_000_000:
                 raise FileNotFoundError(
-                    f"Could not find the full {{source_name}}. Attach the repository/data or enable Internet."
+                    f"Could not find the full {{source_name}}. Expected it under "
+                    f"{{SOURCE_REPO / 'data' / 'processed'}} or a Kaggle Input. "
+                    "Attach the repository dataset containing data/processed; Internet-only "
+                    "clones work only when that tracked data file is present in the selected ref."
                 )
 
             print("Repository:", SOURCE_REPO)
@@ -813,7 +839,7 @@ def build_notebook(method_key: str, config: dict) -> dict:
                     )
                     assert training_manifest["tidpo_source_evidence"][
                         "olmo_adapter_normalized_source_sha256"
-                    ] == "bcf8c44c9ae22ad898299edf70c42ac11f3595ecedd8e521c918af86e454eeb6"
+                    ] == "28b6f8442a34bd6dce361da3d4b48ccd4785cde9b897fc03fcfd62ea1ceaf1ed"
                 for filename, digest in training_manifest["weight_files_sha256"].items():
                     assert sha256_file(POLICY_MODEL / filename) == digest
                 print("Verified policy:", POLICY_MODEL)

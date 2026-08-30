@@ -1470,10 +1470,47 @@ def run_train(args: argparse.Namespace) -> None:
             ):
                 raise ValueError("Policy and reference vocabulary heads are not identically sharded")
 
-            policy_selected = torch.zeros_like(labels, dtype=torch.float32)
             reference_selected = torch.zeros_like(labels, dtype=torch.float32)
-            policy_normalizer = None
             reference_normalizer = None
+            # The reference is frozen, so obtain its exact global log-normalizer first without
+            # retaining a graph. This lets the policy use every FSDP-sharded vocabulary slice
+            # exactly once in the gradient-bearing pass below.
+            for start, reference_shard in zip(
+                self.vocabulary_offsets,
+                reference_head.vocabulary_shards,
+                strict=True,
+            ):
+                stop = start + reference_shard.out_features
+                with torch.no_grad():
+                    reference_logits = reference_shard(reference_hidden_states).float()
+                    belongs = labels.ge(start) & labels.lt(stop)
+                    local_target = (labels - start).clamp(
+                        0, reference_shard.out_features - 1
+                    )
+                    shard_reference_normalizer = torch.logsumexp(
+                        reference_logits, dim=-1
+                    )
+                    shard_reference_selected = torch.gather(
+                        reference_logits, -1, local_target.unsqueeze(-1)
+                    ).squeeze(-1) * belongs
+                reference_selected = reference_selected + shard_reference_selected
+                reference_normalizer = (
+                    shard_reference_normalizer
+                    if reference_normalizer is None
+                    else torch.logaddexp(reference_normalizer, shard_reference_normalizer)
+                )
+
+            policy_selected = torch.zeros_like(labels, dtype=torch.float32)
+            policy_normalizer = None
+            reference_logp_expectation = torch.zeros_like(
+                reference_normalizer, dtype=torch.float32
+            )
+            policy_logit_expectation = torch.zeros_like(
+                reference_normalizer, dtype=torch.float32
+            )
+            reference_probability_mass = torch.zeros_like(
+                reference_normalizer, dtype=torch.float32
+            )
             for start, policy_shard, reference_shard in zip(
                 self.vocabulary_offsets,
                 self.vocabulary_shards,
@@ -1482,9 +1519,10 @@ def run_train(args: argparse.Namespace) -> None:
             ):
                 stop = start + policy_shard.out_features
 
-                def project_normalizers_and_selected(
+                def project_exact_statistics(
                     policy_hidden,
                     reference_hidden,
+                    reference_log_normalizer,
                     target,
                     p_head=policy_shard,
                     r_head=reference_shard,
@@ -1492,91 +1530,60 @@ def run_train(args: argparse.Namespace) -> None:
                     limit=stop,
                 ):
                     policy_logits = p_head(policy_hidden).float()
-                    reference_logits = r_head(reference_hidden).float()
+                    with torch.no_grad():
+                        reference_logps = (
+                            r_head(reference_hidden).float()
+                            - reference_log_normalizer.unsqueeze(-1)
+                        )
+                        reference_probabilities = reference_logps.exp()
                     belongs = target.ge(offset) & target.lt(limit)
                     local_target = (target - offset).clamp(0, p_head.out_features - 1)
                     return (
                         torch.logsumexp(policy_logits, dim=-1),
-                        torch.logsumexp(reference_logits, dim=-1),
                         torch.gather(
                             policy_logits, -1, local_target.unsqueeze(-1)
                         ).squeeze(-1)
                         * belongs,
-                        torch.gather(
-                            reference_logits, -1, local_target.unsqueeze(-1)
-                        ).squeeze(-1)
-                        * belongs,
+                        (reference_probabilities * reference_logps).sum(dim=-1),
+                        (reference_probabilities * policy_logits).sum(dim=-1),
+                        reference_probabilities.sum(dim=-1),
                     )
 
                 (
                     shard_policy_normalizer,
-                    shard_reference_normalizer,
                     shard_policy_selected,
-                    shard_reference_selected,
+                    shard_reference_logp_expectation,
+                    shard_policy_logit_expectation,
+                    shard_reference_mass,
                 ) = activation_checkpoint(
-                    project_normalizers_and_selected,
+                    project_exact_statistics,
                     policy_hidden_states,
                     reference_hidden_states,
+                    reference_normalizer,
                     labels,
                     use_reentrant=False,
                 )
                 policy_selected = policy_selected + shard_policy_selected
-                reference_selected = reference_selected + shard_reference_selected
                 policy_normalizer = (
                     shard_policy_normalizer
                     if policy_normalizer is None
                     else torch.logaddexp(policy_normalizer, shard_policy_normalizer)
                 )
-                reference_normalizer = (
-                    shard_reference_normalizer
-                    if reference_normalizer is None
-                    else torch.logaddexp(reference_normalizer, shard_reference_normalizer)
+                reference_logp_expectation = (
+                    reference_logp_expectation + shard_reference_logp_expectation
                 )
-
-            reference_selected = reference_selected.detach()
-            reference_normalizer = reference_normalizer.detach()
-            per_position_kl = torch.zeros_like(policy_normalizer, dtype=torch.float32)
-            reference_probability_mass = torch.zeros_like(
-                reference_normalizer, dtype=torch.float32
-            )
-            for policy_shard, reference_shard in zip(
-                self.vocabulary_shards,
-                reference_head.vocabulary_shards,
-                strict=True,
-            ):
-                def project_exact_kl(
-                    policy_hidden,
-                    reference_hidden,
-                    policy_log_normalizer,
-                    reference_log_normalizer,
-                    p_head=policy_shard,
-                    r_head=reference_shard,
-                ):
-                    policy_logps = (
-                        p_head(policy_hidden).float() - policy_log_normalizer.unsqueeze(-1)
-                    )
-                    reference_logps = (
-                        r_head(reference_hidden).float() - reference_log_normalizer.unsqueeze(-1)
-                    )
-                    reference_probabilities = reference_logps.exp()
-                    return (
-                        reference_probabilities
-                        * (reference_logps - policy_logps)
-                    ).sum(dim=-1), reference_probabilities.sum(dim=-1)
-
-                shard_kl, shard_reference_mass = activation_checkpoint(
-                    project_exact_kl,
-                    policy_hidden_states,
-                    reference_hidden_states,
-                    policy_normalizer,
-                    reference_normalizer,
-                    use_reentrant=False,
+                policy_logit_expectation = (
+                    policy_logit_expectation + shard_policy_logit_expectation
                 )
-                per_position_kl = per_position_kl + shard_kl
                 reference_probability_mass = (
                     reference_probability_mass + shard_reference_mass
                 )
 
+            per_position_kl = (
+                reference_logp_expectation
+                - policy_logit_expectation
+                + policy_normalizer
+            )
             if not getattr(self, "_exact_kl_audited", False):
                 if not bool(torch.isfinite(per_position_kl).all()):
                     raise FloatingPointError("Non-finite exact full-vocabulary TI-DPO KL")
@@ -1925,20 +1932,6 @@ def run_train(args: argparse.Namespace) -> None:
                     raise RuntimeError(
                         "Official-repo-exact TI-DPO requires a live frozen reference model"
                     )
-                (
-                    policy_logps,
-                    reference_logps,
-                    per_position_kl,
-                ) = model(
-                    input_ids=inputs["input_ids"],
-                    attention_mask=inputs["attention_mask"],
-                    use_cache=False,
-                    preference_labels=inputs["input_ids"][:, 1:],
-                    exact_reference_model=self.live_reference_model,
-                )
-                completion_mask = inputs["completion_mask"]
-                position_kl = (per_position_kl * completion_mask).sum(dim=-1)
-
                 importances = self._gradient_importance(
                     model, inputs["input_ids"], inputs["attention_mask"]
                 )
@@ -1950,24 +1943,40 @@ def run_train(args: argparse.Namespace) -> None:
                 )
                 # The pinned repository normalizes over the full non-padding sequence, shifts
                 # once for next-token predictions, then masks the prompt in the TDPO2 loss.
-                importance_weights = full_importance_weights[:, 1:]
+                pair_importance_weights = full_importance_weights[:, 1:]
 
                 anchor_ids, anchor_attention, anchor_mask = self._sample_live_anchor(
                     model, inputs["prompt_input_ids"], inputs["prompt_attention_mask"]
                 )
-                anchor_policy_logps = model(
-                    input_ids=anchor_ids,
-                    attention_mask=anchor_attention,
-                    use_cache=False,
-                    preference_labels=anchor_ids[:, 1:],
-                )
-                with torch.no_grad():
-                    anchor_reference_logps = self.live_reference_model(
-                        input_ids=anchor_ids,
-                        attention_mask=anchor_attention,
-                        use_cache=False,
-                        preference_labels=anchor_ids[:, 1:],
+                combined_ids, combined_attention, combined_mask = (
+                    self._combine_pair_and_anchor(
+                        inputs, anchor_ids, anchor_attention, anchor_mask
                     )
+                )
+                (
+                    policy_all_logps,
+                    reference_all_logps,
+                    all_per_position_kl,
+                ) = model(
+                    input_ids=combined_ids,
+                    attention_mask=combined_attention,
+                    use_cache=False,
+                    preference_labels=combined_ids[:, 1:],
+                    exact_reference_model=self.live_reference_model,
+                )
+                pair_rows = inputs["input_ids"].shape[0]
+                policy_logps = policy_all_logps[:pair_rows]
+                reference_logps = reference_all_logps[:pair_rows]
+                completion_mask = combined_mask[:pair_rows]
+                importance_weights = torch.zeros_like(policy_logps, dtype=torch.float32)
+                importance_weights[:, : pair_importance_weights.shape[1]] = (
+                    pair_importance_weights
+                )
+                position_kl = (
+                    all_per_position_kl[:pair_rows] * completion_mask
+                ).sum(dim=-1)
+                anchor_policy_logps = policy_all_logps[pair_rows:]
+                anchor_reference_logps = reference_all_logps[pair_rows:]
                 ratios = policy_logps - reference_logps.to(policy_logps.dtype)
                 anchor_ratios = anchor_policy_logps - anchor_reference_logps.to(
                     anchor_policy_logps.dtype
@@ -1975,7 +1984,7 @@ def run_train(args: argparse.Namespace) -> None:
                 pair_count = policy_logps.shape[0] // 2
                 triplet = packed_triplet_loss(
                     anchor_ratios,
-                    anchor_mask,
+                    combined_mask[pair_rows:],
                     ratios[:pair_count],
                     completion_mask[:pair_count],
                     ratios[pair_count:],
@@ -2013,7 +2022,7 @@ def run_train(args: argparse.Namespace) -> None:
                 extra["importance_weight_min_valid"] = importance_weights[
                     completion_mask
                 ].min().detach()
-                extra["anchor_tokens"] = anchor_mask.sum().to(torch.float32)
+                extra["anchor_tokens"] = combined_mask[pair_rows:].sum().to(torch.float32)
             elif paper_exact:
                 if self.live_reference_model is None:
                     raise RuntimeError("Paper-exact TI-DPO requires a live frozen reference model")

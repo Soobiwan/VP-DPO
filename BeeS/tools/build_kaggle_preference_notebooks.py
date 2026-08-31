@@ -305,7 +305,7 @@ def build_notebook(method_key: str, config: dict) -> dict:
             requirements = PROJECT_ROOT / {requirements_file!r}
             if TIDPO_VARIANT == "official_repo_exact":
                 expected_adapter_hash = (
-                    "28b6f8442a34bd6dce361da3d4b48ccd4785cde9b897fc03fcfd62ea1ceaf1ed"
+                    "e0f4b1324b168c8d7de289b80a50bd7b4b252a98b6f14d3669cced87ee82119c"
                 )
                 actual_adapter_hash = normalized_source_sha256(
                     PROJECT_ROOT / "olmo2_bees" / "train_preference_suite.py"
@@ -839,7 +839,7 @@ def build_notebook(method_key: str, config: dict) -> dict:
                     )
                     assert training_manifest["tidpo_source_evidence"][
                         "olmo_adapter_normalized_source_sha256"
-                    ] == "28b6f8442a34bd6dce361da3d4b48ccd4785cde9b897fc03fcfd62ea1ceaf1ed"
+                    ] == "e0f4b1324b168c8d7de289b80a50bd7b4b252a98b6f14d3669cced87ee82119c"
                 for filename, digest in training_manifest["weight_files_sha256"].items():
                     assert sha256_file(POLICY_MODEL / filename) == digest
                 print("Verified policy:", POLICY_MODEL)

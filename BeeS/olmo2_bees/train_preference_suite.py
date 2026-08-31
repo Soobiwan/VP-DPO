@@ -1723,6 +1723,7 @@ def run_train(args: argparse.Namespace) -> None:
             if self.live_reference_model is not None:
                 self.live_reference_model.to(self.accelerator.device)
                 self.live_reference_model.eval()
+            self.fsdp_root_initialized = False
             self.maybe_activation_offload_context = (
                 get_act_offloading_ctx_manager(model=self.model, max_fwd_stash_size=1)
                 if args.activation_offloading
@@ -1761,6 +1762,27 @@ def run_train(args: argparse.Namespace) -> None:
                     allow_unused=False,
                 )[0]
                 return gradients.detach().abs().sum(dim=-1)
+            finally:
+                model.train(original_training)
+
+        def _initialize_fsdp_root(self, model, input_ids):
+            """Run one root forward before attribution accesses the sharded embedding module."""
+            if self.fsdp_root_initialized:
+                return
+            original_training = model.training
+            model.eval()
+            try:
+                warmup_ids = input_ids[:1, :1]
+                with torch.no_grad():
+                    target = model(
+                        input_ids=warmup_ids,
+                        attention_mask=torch.ones_like(warmup_ids),
+                        use_cache=False,
+                        importance_only=True,
+                    )
+                if target.shape != (1,) or not bool(torch.isfinite(target).all()):
+                    raise RuntimeError(f"Invalid FSDP root warm-up target: {target}")
+                self.fsdp_root_initialized = True
             finally:
                 model.train(original_training)
 
@@ -1932,6 +1954,7 @@ def run_train(args: argparse.Namespace) -> None:
                     raise RuntimeError(
                         "Official-repo-exact TI-DPO requires a live frozen reference model"
                     )
+                self._initialize_fsdp_root(model, inputs["input_ids"])
                 importances = self._gradient_importance(
                     model, inputs["input_ids"], inputs["attention_mask"]
                 )

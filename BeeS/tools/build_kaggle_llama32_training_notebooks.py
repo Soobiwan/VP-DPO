@@ -356,6 +356,55 @@ def build_notebook(model: dict[str, str], method: dict[str, str | int]) -> dict:
                         raise RuntimeError(
                             "Could not remove the stale OLMo token-count guard from the runtime copy"
                         )
+                    old_response_alignment = (
+                        "    response_start = len(prompt_text)\n"
+                        "    response_end = response_start + len(response)\n"
+                        "    if full_text[response_start:response_end] != response:\n"
+                        '        raise ValueError("Assistant content is not contiguous in the rendered chat")\n'
+                    )
+                    if old_response_alignment in structured_source:
+                        structured_source = structured_source.replace(
+                            old_response_alignment,
+                            "    response_start = len(prompt_text)\n"
+                            "    if full_text.startswith(response, response_start):\n"
+                            "        rendered_response = response\n"
+                            "        rendered_char_segment_ids = response_char_segment_ids\n"
+                            "    else:\n"
+                            "        rendered_response = response.strip()\n"
+                            "        leading_trim = len(response) - len(response.lstrip())\n"
+                            "        trailing_trim = len(response) - len(response.rstrip())\n"
+                            "        rendered_stop = (\n"
+                            "            len(response) - trailing_trim if trailing_trim else len(response)\n"
+                            "        )\n"
+                            "        rendered_char_segment_ids = response_char_segment_ids[\n"
+                            "            leading_trim:rendered_stop\n"
+                            "        ]\n"
+                            "        if not rendered_response or not full_text.startswith(\n"
+                            "            rendered_response, response_start\n"
+                            "        ):\n"
+                            "            raise ValueError(\n"
+                            '                "Assistant content is neither preserved nor "\n'
+                            '                "outer-whitespace-trimmed in the rendered chat"\n'
+                            "            )\n"
+                            "    if len(rendered_char_segment_ids) != len(rendered_response):\n"
+                            '        raise RuntimeError("Rendered response/segment character alignment differs")\n'
+                            "    response_end = response_start + len(rendered_response)\n",
+                            1,
+                        )
+                        structured_source = structured_source.replace(
+                            "        overlapping_ids = response_char_segment_ids[local_start:local_end]\n",
+                            "        overlapping_ids = rendered_char_segment_ids[local_start:local_end]\n",
+                            1,
+                        )
+                        applied.append("chat-template outer-whitespace alignment")
+                    if (
+                        "Assistant content is not contiguous in the rendered chat"
+                        in structured_source
+                        or "rendered_char_segment_ids" not in structured_source
+                    ):
+                        raise RuntimeError(
+                            "Could not make assistant alignment compatible with Llama's chat template"
+                        )
                     structured_source = structured_source.replace(
                         "Tokenizing segmented OLMo pairs", "Tokenizing segmented pairs"
                     )

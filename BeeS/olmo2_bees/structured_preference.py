@@ -184,10 +184,36 @@ def encode_segmented_side(
     )
     if not full_text.startswith(prompt_text):
         raise ValueError("Full chat rendering does not begin with the generation prompt")
+
+    # Chat templates are allowed to normalize message-boundary whitespace. Llama 3.2's
+    # official template applies Jinja's ``trim`` filter to every message, whereas OLMo's
+    # template preserves assistant content. Keep either behavior lossless with respect to
+    # the text actually presented to the model, and map any trimmed view back to the source
+    # segment ownership instead of rejecting a valid BeeS row.
     response_start = len(prompt_text)
-    response_end = response_start + len(response)
-    if full_text[response_start:response_end] != response:
-        raise ValueError("Assistant content is not contiguous in the rendered chat")
+    if full_text.startswith(response, response_start):
+        rendered_response = response
+        rendered_char_segment_ids = response_char_segment_ids
+        template_trimmed_characters = 0
+    else:
+        rendered_response = response.strip()
+        leading_trim = len(response) - len(response.lstrip())
+        trailing_trim = len(response) - len(response.rstrip())
+        rendered_stop = len(response) - trailing_trim if trailing_trim else len(response)
+        rendered_char_segment_ids = response_char_segment_ids[
+            leading_trim:rendered_stop
+        ]
+        template_trimmed_characters = leading_trim + trailing_trim
+        if not rendered_response or not full_text.startswith(
+            rendered_response, response_start
+        ):
+            raise ValueError(
+                "Assistant content is neither preserved nor outer-whitespace-trimmed "
+                "in the rendered chat"
+            )
+    if len(rendered_char_segment_ids) != len(rendered_response):
+        raise RuntimeError("Rendered response/segment character alignment differs")
+    response_end = response_start + len(rendered_response)
 
     encoded = tokenizer(full_text, add_special_tokens=False, return_offsets_mapping=True)
     input_ids = list(encoded["input_ids"])
@@ -221,7 +247,7 @@ def encode_segmented_side(
             continue
         local_start = overlap_start - response_start
         local_end = overlap_end - response_start
-        overlapping_ids = response_char_segment_ids[local_start:local_end]
+        overlapping_ids = rendered_char_segment_ids[local_start:local_end]
         counts = Counter(overlapping_ids)
         token_segment_candidates[token_index] = counts
         # Prefer the later segment on an exact tie, matching causal ownership of
@@ -265,6 +291,7 @@ def encode_segmented_side(
         "content_tokens": content_token_count,
         "boundary_crossing_tokens": boundary_crossing_tokens,
         "segments_exact": "".join(segment["text"] for segment in segments) == response,
+        "template_trimmed_characters": template_trimmed_characters,
     }
 
 
@@ -333,6 +360,8 @@ def prepare_segmented_dataset(
         "max_pair_tokens": 0,
         "max_segments_per_side": 0,
         "source_token_count_drift_sides": 0,
+        "template_trimmed_sides": 0,
+        "template_trimmed_characters": 0,
     }
     with source_jsonl.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(tqdm(handle, desc="Tokenizing segmented pairs"), 1):
@@ -391,6 +420,12 @@ def prepare_segmented_dataset(
             stats["boundary_crossing_tokens"] += chosen["boundary_crossing_tokens"] + rejected[
                 "boundary_crossing_tokens"
             ]
+            stats["template_trimmed_sides"] += int(
+                chosen["template_trimmed_characters"] > 0
+            ) + int(rejected["template_trimmed_characters"] > 0)
+            stats["template_trimmed_characters"] += chosen[
+                "template_trimmed_characters"
+            ] + rejected["template_trimmed_characters"]
             stats["max_pair_tokens"] = max(
                 stats["max_pair_tokens"], len(chosen["input_ids"]), len(rejected["input_ids"])
             )

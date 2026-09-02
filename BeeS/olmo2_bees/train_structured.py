@@ -451,8 +451,10 @@ def run_train(args: argparse.Namespace) -> None:
             f"{reference_manifest_path}"
         )
     reference_manifest = json.loads(reference_manifest_path.read_text(encoding="utf-8"))
+    # A Kaggle reference-only output is remounted under /kaggle/input in the training
+    # session, so its absolute dataset path necessarily changes.  Content identity is
+    # enforced by the deterministic Dataset fingerprint plus the remaining fields.
     expected_reference = {
-        "dataset_path": str(args.dataset_path.resolve()),
         "dataset_fingerprint": train_dataset._fingerprint,
         "split": args.train_split,
         "rows": len(train_dataset),

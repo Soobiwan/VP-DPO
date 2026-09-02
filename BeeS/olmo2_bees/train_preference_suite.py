@@ -36,6 +36,9 @@ TIDPO_REPOSITORY = "https://github.com/gracefulning/TIDPO"
 TIDPO_COMMIT = "e04a0926869a8f9fe9c9e9ce395394fd2c697fe2"
 TIDPO_UPSTREAM_SOURCE_HASHES = {
     "trainers.py": "5fb907eecc2d00a6b97d7ac45db4bd86ce4d58197b7a58363233e40040ae113f",
+    "config/config.yaml": (
+        "515b74cf7e7461049bcbf78519564acae0ec36516194e723b8f372e6ef3c4f88"
+    ),
     "config/loss/tidpo.yaml": (
         "e77343adb00fa27a0d54d9c806a12510291b2c779be1639ea5e86da74149a1e8"
     ),
@@ -1141,10 +1144,19 @@ def run_train(args: argparse.Namespace) -> None:
                 "Vendored TI-DPO source does not match pinned upstream commit "
                 f"{TIDPO_COMMIT}: manifest={upstream_manifest}, hashes={actual_upstream_hashes}"
             )
+        upstream_config = (upstream_root / "config" / "config.yaml").read_text(
+            encoding="utf-8"
+        )
+        if "\noptimizer: RMSprop\n" not in f"\n{upstream_config}":
+            raise RuntimeError("Pinned TI-DPO configuration no longer selects RMSprop")
         upstream_evidence = {
             "repository": TIDPO_REPOSITORY,
             "commit": TIDPO_COMMIT,
             "verified_normalized_source_sha256": actual_upstream_hashes,
+            "optimizer": {
+                "implementation": "torch.optim.RMSprop",
+                "source": "config/config.yaml",
+            },
             "olmo_adapter_normalized_source_sha256": _normalized_source_sha256(
                 Path(__file__).resolve()
             ),
@@ -2254,6 +2266,18 @@ def run_train(args: argparse.Namespace) -> None:
         def create_optimizer(self):
             super().create_optimizer()
             optimizer = self.optimizer
+            if repo_exact:
+                if not isinstance(optimizer, torch.optim.RMSprop):
+                    raise RuntimeError(
+                        "Official-repo-exact TI-DPO requires the upstream repository's "
+                        f"torch RMSprop optimizer, got {type(optimizer)}"
+                    )
+                # Avoid multi-tensor optimizer kernels over FSDP2 DTensors. This selects the
+                # single-tensor implementation of the same RMSprop update used by the repository.
+                optimizer.defaults["foreach"] = False
+                for group in optimizer.param_groups:
+                    group["foreach"] = False
+                return optimizer
             optimizer_args = getattr(optimizer, "args", None)
             is_paged_32bit = bool(
                 getattr(optimizer, "is_paged", False)
@@ -2441,6 +2465,7 @@ def run_train(args: argparse.Namespace) -> None:
 
     save_enabled = args.save_steps > 0
     run_name = args.run_name or f"olmo2-1b-bees-{args.method.lower()}"
+    optimizer_name = "rmsprop" if repo_exact else "paged_adamw_32bit"
     training_args = TrainingArguments(
         output_dir=str(args.output_dir),
         run_name=run_name,
@@ -2456,7 +2481,7 @@ def run_train(args: argparse.Namespace) -> None:
         adam_beta2=0.95,
         adam_epsilon=1e-8,
         max_grad_norm=1.0,
-        optim="paged_adamw_32bit",
+        optim=optimizer_name,
         fp16=True,
         bf16=False,
         tf32=False,
@@ -2525,8 +2550,19 @@ def run_train(args: argparse.Namespace) -> None:
         getattr(trainer.optimizer, "optim_bits", 0)
         or getattr(optimizer_args, "optim_bits", 0)
         or (32 if isinstance(trainer.optimizer, bnb.optim.PagedAdamW32bit) else 0)
+        or (32 if isinstance(trainer.optimizer, torch.optim.RMSprop) else 0)
     )
-    if not optimizer_is_paged or optimizer_bits != 32:
+    if repo_exact:
+        if (
+            not isinstance(trainer.optimizer, torch.optim.RMSprop)
+            or optimizer_is_paged
+            or optimizer_bits != 32
+        ):
+            raise RuntimeError(
+                f"Expected non-paged torch RMSprop with FP32 state, got {optimizer_class} "
+                f"(is_paged={optimizer_is_paged}, bits={optimizer_bits})"
+            )
+    elif not optimizer_is_paged or optimizer_bits != 32:
         raise RuntimeError(
             f"Expected paged 32-bit AdamW, got {optimizer_class} "
             f"(is_paged={optimizer_is_paged}, bits={optimizer_bits})"
@@ -2654,9 +2690,9 @@ def run_train(args: argparse.Namespace) -> None:
                 ),
                 "tidpo_controlled_port_disclosure": (
                     "The method-specific objective and pinned defaults match the official "
-                    "repository. The base model, dataset, optimizer, schedule, precision, and "
-                    "distributed runtime are the shared OLMo comparison recipe, not the "
-                    "authors' Llama/Mistral experiment recipe."
+                    "repository. The optimizer is also the repository-default torch RMSprop; "
+                    "the base model, dataset, schedule, precision, and distributed runtime are "
+                    "the OLMo comparison recipe, not the authors' Llama/Mistral experiment recipe."
                     if repo_exact
                     else None
                 ),
@@ -2747,10 +2783,15 @@ def run_train(args: argparse.Namespace) -> None:
                     else None
                 ),
                 "live_frozen_reference_model": live_tidpo,
-                "optimizer": "bitsandbytes.optim.PagedAdamW32bit",
+                "optimizer": (
+                    "torch.optim.RMSprop"
+                    if repo_exact
+                    else "bitsandbytes.optim.PagedAdamW32bit"
+                ),
                 "optimizer_class": optimizer_class,
                 "optimizer_is_paged": optimizer_is_paged,
                 "optimizer_state_bits": optimizer_bits,
+                "optimizer_foreach": trainer.optimizer.defaults.get("foreach"),
                 "fp16_initial_loss_scale": FP16_INITIAL_SCALE,
                 "master_parameter_dtype": "float32",
                 "compute_dtype": "float16",

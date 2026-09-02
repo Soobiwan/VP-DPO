@@ -1,6 +1,6 @@
 # VP-DPO / BeeS experiments
 
-This repository contains preference-data selection, DPO-family training, ranking, and evaluation experiments built around BeeS, OLMo 2 1B, and MiniCPM. The repository is organized by purpose so that runnable notebooks, reusable code, input data, configuration, and generated output do not get mixed together.
+This repository contains preference-data selection, DPO-family training, ranking, and evaluation experiments built around BeeS, Llama 3.2, OLMo 2 1B, and MiniCPM. The repository is organized by purpose so that runnable notebooks, reusable code, input data, configuration, and generated output do not get mixed together.
 
 ## Repository map
 
@@ -9,7 +9,9 @@ This repository contains preference-data selection, DPO-family training, ranking
 | `BeeS/` | Main Python implementation, training/evaluation modules, notebook builders, prompt templates, and the canonical two-notebook OLMo workflow. |
 | `BeeS/notebooks/` | Start-to-finish local OLMo 2 workflow: prepare/select data, then train and evaluate DPO. |
 | `notebooks/local/` | Local workstation experiments, including Ollama ranking and the multi-method dual-GPU run. |
-| `notebooks/kaggle/` | Self-contained Kaggle notebooks for MiniCPM and OLMo methods on P100 or dual T4 GPUs. |
+| `notebooks/kaggle/` | Self-contained Kaggle notebooks for MiniCPM, OLMo, and Llama methods on P100 or dual T4 GPUs. |
+| `notebooks/kaggle/llama32_1b_training/` | One-method-per-notebook Llama 3.2 1B training suite for Kaggle T4 x2; all non-TIDPO methods use the canonical BeeS JSONL. |
+| `notebooks/kaggle/llama32_3b_training/` | Separate Llama 3.2 3B version of the same non-TIDPO Kaggle T4 x2 training suite. |
 | `notebooks/kaggle/per_model_dual_t4/` | One-model-per-notebook, dual-T4 evaluation suite for MMLU, GSM8K, GPQA, HumanEval, TruthfulQA, and IFEval. |
 | `notebooks/evaluation/` | AlpacaEval judge notebook. |
 | `scripts/evaluation/` | Command-line AlpacaEval runner and Azure OpenAI compatibility adapter. |
@@ -29,6 +31,11 @@ The clearest reproducible path is the OLMo 2 1B BeeS workflow:
 3. Optionally run `notebooks/evaluation/alpaca-eval-2-judge.ipynb` directly, or use the command-line wrapper described below.
 
 See `BeeS/OLMO2_BEES_README.md` for the design, GPU-memory strategy, checkpoint behavior, pinned model/dataset revisions, and accuracy gate.
+
+For the current Llama experiments, choose one notebook from
+`notebooks/kaggle/llama32_1b_training/` or `notebooks/kaggle/llama32_3b_training/`.
+The suites cover Simple DPO, VPDPO A, B/B_norm/C with DPO or VDPO cores, SimPO, and SamPO.
+TIDPO is intentionally excluded until its original notebook is corrected.
 
 ## Setup
 
@@ -80,6 +87,7 @@ Choose the `VP-DPO (OLMo)` kernel, then open the relevant notebook:
 - `BeeS/notebooks/`: primary local preparation and DPO workflow.
 - `notebooks/local/`: local Ollama ranking and experimental multi-method training.
 - `notebooks/kaggle/`: upload the selected notebook to Kaggle and use the accelerator named in its filename. These notebooks manage Kaggle input/output paths themselves.
+- `notebooks/kaggle/llama32_1b_training/` and `notebooks/kaggle/llama32_3b_training/`: accept the Llama 3.2 license, add a `Huggingface` or `HF_TOKEN` Kaggle secret, select T4 x2, and run one method notebook per session.
 - `notebooks/kaggle/per_model_dual_t4/`: choose one model notebook, attach its configured Kaggle input, select GPU T4 x2, and run all cells to produce raw artifacts, scores, and a ZIP before moving to the next model.
 - `notebooks/evaluation/`: interactive AlpacaEval judging.
 
@@ -121,6 +129,7 @@ python BeeS/tools/build_notebooks.py
 python BeeS/tools/build_structured_notebook.py
 python BeeS/tools/build_kaggle_preference_notebooks.py
 python BeeS/tools/build_kaggle_method_b_norm_notebooks.py
+python BeeS/tools/build_kaggle_llama32_training_notebooks.py
 python scripts/build_dual_t4_eval_notebooks.py
 ```
 

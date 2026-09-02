@@ -35,9 +35,10 @@ METHODS = {
             "full-vocabulary KL(ref||policy), full-sequence last-logit gradient/Gaussian token "
             "weights, and a same-prompt anchor sampled live from the current policy. The notebook "
             "hash-verifies the vendored upstream source and writes the commit, exactness flags, "
-            "and adapter hash into the training manifest. OLMo, BeeS data, optimizer, schedule, "
-            "precision, and FSDP2 are the shared controlled comparison recipe, so this is an exact "
-            "TI-DPO method port rather than a reproduction of the authors' Llama/Mistral runs."
+            "and adapter hash into the training manifest. It uses the repository-default PyTorch "
+            "RMSprop optimizer; OLMo, BeeS data, schedule, precision, and FSDP2 are the controlled "
+            "comparison recipe. This is an exact TI-DPO method port rather than a reproduction of "
+            "the authors' Llama/Mistral runs."
         ),
         "top_k": 0,
         "anchors": False,
@@ -149,6 +150,15 @@ def build_notebook(method_key: str, config: dict) -> dict:
     requirements_file = (
         "requirements-olmo2-training.txt" if repo_exact else "requirements-olmo2.txt"
     )
+    optimizer_description = (
+        "FP32 PyTorch RMSprop state (the pinned TI-DPO repository default)"
+        if repo_exact
+        else "paged FP32 AdamW states"
+    )
+    optimizer_cleanup_description = "optimizer state" if repo_exact else "paged optimizer files"
+    restart_optimizer_description = (
+        "RMSprop optimizer state" if repo_exact else "paged optimizer states"
+    )
     audited_packages = [
         "torch", "transformers", "datasets", "accelerate", "trl", "bitsandbytes", "safetensors"
     ]
@@ -176,9 +186,9 @@ def build_notebook(method_key: str, config: dict) -> dict:
             # OLMo 2 1B — {display} on Kaggle T4 x2
 
             This standalone notebook trains one full-parameter `{MODEL_ID}` policy with **both**
-            Kaggle T4 GPUs through FSDP2 full sharding. It keeps FP32 master weights and paged FP32
-            AdamW states, uses FP16 only for compute, and does not use LoRA, PEFT, QLoRA, or weight
-            quantization.
+            Kaggle T4 GPUs through FSDP2 full sharding. It keeps FP32 master weights and
+            {optimizer_description}, uses FP16 only for compute, and does not use LoRA, PEFT,
+            QLoRA, or weight quantization.
 
             Before running, choose **GPU T4 x2** under *Settings → Accelerator* and enable Internet,
             or attach this repository as a Kaggle Dataset input. Kaggle currently limits GPU notebook
@@ -196,7 +206,7 @@ def build_notebook(method_key: str, config: dict) -> dict:
             - `/kaggle/working`: either the reusable TIDPO reference cache, one final FP32 model, or
               small evaluation results—never all transient copies at once.
             - Restart checkpoints are disabled. Any stale `checkpoint-*`, scheduler, scaler, RNG, or
-              paged optimizer files under this run are explicitly removed.
+              {optimizer_cleanup_description} under this run are explicitly removed.
 
             Resource reference: [Kaggle Notebooks documentation](https://www.kaggle.com/docs/notebooks).
             """
@@ -305,7 +315,7 @@ def build_notebook(method_key: str, config: dict) -> dict:
             requirements = PROJECT_ROOT / {requirements_file!r}
             if TIDPO_VARIANT == "official_repo_exact":
                 expected_adapter_hash = (
-                    "e0f4b1324b168c8d7de289b80a50bd7b4b252a98b6f14d3669cced87ee82119c"
+                    "aca6d02db9f494e890b7629bf754c935343d912ec5a4be9436971628b6e3b694"
                 )
                 actual_adapter_hash = normalized_source_sha256(
                     PROJECT_ROOT / "olmo2_bees" / "train_preference_suite.py"
@@ -438,6 +448,10 @@ def build_notebook(method_key: str, config: dict) -> dict:
                     (
                         "trainers.py",
                         "5fb907eecc2d00a6b97d7ac45db4bd86ce4d58197b7a58363233e40040ae113f",
+                    ),
+                    (
+                        "config/config.yaml",
+                        "515b74cf7e7461049bcbf78519564acae0ec36516194e723b8f372e6ef3c4f88",
                     ),
                     (
                         "config/loss/tidpo.yaml",
@@ -677,7 +691,7 @@ def build_notebook(method_key: str, config: dict) -> dict:
             f"""
             ## 8. Train {display} with both T4 GPUs
 
-            `SAVE_STEPS=0` prevents FSDP weights and paged optimizer states from ever being written
+            `SAVE_STEPS=0` prevents FSDP weights and {restart_optimizer_description} from being written
             as restart checkpoints. The trainer saves only the consolidated FP32 final model.
             """
         ),
@@ -790,13 +804,15 @@ def build_notebook(method_key: str, config: dict) -> dict:
                 assert training_manifest["full_parameter_training"] is True
                 assert training_manifest["peft_or_lora"] is False
                 assert training_manifest["weight_quantization"] is None
-                assert training_manifest["optimizer_is_paged"] is True
                 assert training_manifest["optimizer_state_bits"] == 32
                 assert training_manifest["saved_weight_dtypes"] == ["F32"]
                 assert training_manifest["parallelism"] == "FSDP2_FULL_SHARD"
                 assert training_manifest["world_size"] == 2
                 assert training_manifest["restart_checkpoints_enabled"] is False
                 if TIDPO_VARIANT == "official_repo_exact":
+                    assert training_manifest["optimizer"] == "torch.optim.RMSprop"
+                    assert training_manifest["optimizer_is_paged"] is False
+                    assert training_manifest["optimizer_foreach"] is False
                     assert training_manifest["tidpo_fidelity"] == "official_repository_objective_exact"
                     assert training_manifest["tidpo_upstream_commit"] == (
                         "e04a0926869a8f9fe9c9e9ce395394fd2c697fe2"
@@ -837,9 +853,15 @@ def build_notebook(method_key: str, config: dict) -> dict:
                     assert training_manifest["tidpo_source_evidence"]["commit"] == (
                         "e04a0926869a8f9fe9c9e9ce395394fd2c697fe2"
                     )
+                    assert training_manifest["tidpo_source_evidence"]["optimizer"] == {{
+                        "implementation": "torch.optim.RMSprop",
+                        "source": "config/config.yaml",
+                    }}
                     assert training_manifest["tidpo_source_evidence"][
                         "olmo_adapter_normalized_source_sha256"
-                    ] == "e0f4b1324b168c8d7de289b80a50bd7b4b252a98b6f14d3669cced87ee82119c"
+                    ] == "aca6d02db9f494e890b7629bf754c935343d912ec5a4be9436971628b6e3b694"
+                else:
+                    assert training_manifest["optimizer_is_paged"] is True
                 for filename, digest in training_manifest["weight_files_sha256"].items():
                     assert sha256_file(POLICY_MODEL / filename) == digest
                 print("Verified policy:", POLICY_MODEL)

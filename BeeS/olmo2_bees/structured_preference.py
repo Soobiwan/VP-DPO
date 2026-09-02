@@ -320,7 +320,9 @@ def prepare_segmented_dataset(
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
     if not tokenizer.is_fast or not tokenizer.chat_template:
-        raise RuntimeError("OLMo preparation requires its fast tokenizer and official chat template")
+        raise RuntimeError(
+            "Segmented preparation requires a fast tokenizer and an official chat template"
+        )
 
     records_by_split: dict[str, list[dict[str, Any]]] = {"train": [], "test": []}
     stats = {
@@ -330,9 +332,10 @@ def prepare_segmented_dataset(
         "boundary_crossing_tokens": 0,
         "max_pair_tokens": 0,
         "max_segments_per_side": 0,
+        "source_token_count_drift_sides": 0,
     }
     with source_jsonl.open("r", encoding="utf-8") as handle:
-        for line_number, line in enumerate(tqdm(handle, desc="Tokenizing segmented OLMo pairs"), 1):
+        for line_number, line in enumerate(tqdm(handle, desc="Tokenizing segmented pairs"), 1):
             if not line.strip():
                 continue
             row = json.loads(line)
@@ -352,10 +355,17 @@ def prepare_segmented_dataset(
             rejected = encode_segmented_side(
                 tokenizer, prompt, row["rejected"], row["rejected_segments"], max_length
             )
-            if "chosen_tokens" in row and len(chosen["input_ids"]) != int(row["chosen_tokens"]):
-                raise ValueError(f"Chosen token count drift at line {line_number}")
-            if "rejected_tokens" in row and len(rejected["input_ids"]) != int(row["rejected_tokens"]):
-                raise ValueError(f"Rejected token count drift at line {line_number}")
+            # The tracked BeeS JSONL stores token counts from the tokenizer that created it.
+            # They are provenance, not a cross-model invariant: retokenizing the same text for
+            # Llama (or any other model) is expected to produce different lengths.  The lossless
+            # offset/segment checks above remain authoritative for the active tokenizer.
+            stats["source_token_count_drift_sides"] += int(
+                "chosen_tokens" in row
+                and len(chosen["input_ids"]) != int(row["chosen_tokens"])
+            ) + int(
+                "rejected_tokens" in row
+                and len(rejected["input_ids"]) != int(row["rejected_tokens"])
+            )
 
             record = {
                 "dataset_index": len(records_by_split[split]),

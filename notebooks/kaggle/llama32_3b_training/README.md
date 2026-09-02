@@ -18,6 +18,10 @@ annotations with the pinned Llama tokenizer.
 5. Run one notebook at a time. Objectives requiring a reference cache can be split into a
    reference-only version followed by a training version.
 
+Standalone notebook uploads stage a writable copy of the training package and apply the
+Llama token-count/remounted-cache compatibility changes there. The attached or cloned
+repository and canonical BeeS dataset are never modified.
+
 ## Notebook index
 
 | # | Method | Notebook |

@@ -1014,6 +1014,7 @@ def validate_notebook(
         DATASET_FILENAME,
         DATASET_SHA256,
         "data/processed/",
+        "apply_llama_runtime_compatibility",
         "BUILD_REFERENCE_ONLY",
         "RUN_TRAINING",
         "training_manifest.json",
@@ -1062,6 +1063,10 @@ def build_readme(model: dict[str, str]) -> str:
         4. Attach the repository/dataset input, or allow the notebook to clone the repository.
         5. Run one notebook at a time. Objectives requiring a reference cache can be split into a
            reference-only version followed by a training version.
+
+        Standalone notebook uploads stage a writable copy of the training package and apply the
+        Llama token-count/remounted-cache compatibility changes there. The attached or cloned
+        repository and canonical BeeS dataset are never modified.
 
         ## Notebook index
 

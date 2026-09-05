@@ -1,0 +1,14 @@
+# Install a PyTorch build suitable for your CUDA/CPU runtime first.
+# The notebook installs the chosen harness checkout with its [hf,ifeval] extras.
+torch>=2.6,<3
+transformers>=4.45,<5
+datasets>=3.1,<4
+evaluate>=0.4.3,<0.5
+accelerate>=0.34,<2
+peft>=0.13,<0.19
+huggingface-hub>=0.26,<1
+nltk>=3.9.1,<4
+pandas>=2.2,<3
+jupyterlab>=4,<5
+ipykernel>=6,<7
+ipywidgets>=8.1,<9

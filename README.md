@@ -13,7 +13,7 @@ This repository contains preference-data selection, DPO-family training, ranking
 | `notebooks/kaggle/llama32_1b_training/` | One-method-per-notebook Llama 3.2 1B training suite for Kaggle T4 x2; all non-TIDPO methods use the canonical BeeS JSONL. |
 | `notebooks/kaggle/llama32_3b_training/` | Separate Llama 3.2 3B version of the same non-TIDPO Kaggle T4 x2 training suite. |
 | `notebooks/kaggle/per_model_dual_t4/` | One-model-per-notebook, dual-T4 evaluation suite for MMLU, GSM8K, GPQA, HumanEval, TruthfulQA, and IFEval. |
-| `notebooks/evaluation/` | AlpacaEval judge notebook. |
+| `notebooks/evaluation/` | AlpacaEval judge notebook and the self-contained [Hugging Face harness suite](notebooks/evaluation/lm_harness/README.md) for six benchmarks. |
 | `scripts/evaluation/` | Command-line AlpacaEval runner and Azure OpenAI compatibility adapter. |
 | `scripts/ranking/` | Resumable Ollama segmenter/ranker used by the local ranking notebook. |
 | `data/processed/` | Tracked BeeS-selected and segmented UltraFeedback JSONL data plus its manifest. |
